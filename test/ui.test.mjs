@@ -79,7 +79,7 @@ test('frontend contract and responsive interactions',async t=>{
     assert.match(await page.locator('[data-aggregate="issues"] .aggregate-value').getAttribute('class'),/issue-danger/);
     assert.equal(await page.locator('[data-aggregate="commits"] .aggregate-value strong').textContent(),'10');
     assert.equal(await page.locator('[data-project="one"] [data-metric="stars"] .spark-value').textContent(),'0');
-    assert.equal(await page.locator('[data-project="one"] [data-metric="stars"] .chart-area').count(),1);
+    assert.equal(await page.locator('[data-project="one"] [data-metric="stars"] .chart-dot').count(),1);
     assert.equal(await page.locator('[data-metric="star_activity"]').count(),0);assert.equal(await page.locator('option[value="star_activity"]').count(),0);
     assert.equal(await page.locator('option').filter({hasText:'Unknown'}).count(),0);
     assert.equal(await page.locator('[data-project="two"] .visibility-icon').getAttribute('aria-label'),'Private repository');assert.equal(await page.locator('[data-project="one"] .visibility-icon').getAttribute('title'),'Public repository');assert.equal(await page.locator('[data-project="one"] .eye-slash').count(),0);assert.equal(await page.locator('[data-project="two"] .eye-slash').count(),1);assert.equal(await page.locator('[data-project="two"] .badge.archived').count(),1);
@@ -90,7 +90,7 @@ test('frontend contract and responsive interactions',async t=>{
     await page.selectOption('#card-metric-0','views');await page.selectOption('#card-metric-2','commits');await page.click('#preferences-form button[type="submit"]');await page.keyboard.press('Escape');
     assert.equal(await page.inputValue('[data-slot="0"]'),'views');assert.equal(await page.inputValue('[data-slot="2"]'),'commits');
     await page.reload();await page.waitForSelector('.project-card');assert.equal(await page.inputValue('[data-slot="0"]'),'views');
-    await page.selectOption('#scope-filter','private');assert.equal(await page.locator('[data-aggregate="views"]').count(),0);assert.equal(await page.locator('[data-aggregate="issues"]').count(),1);
+    await page.selectOption('#scope-filter','private');assert.equal(await page.locator('[data-aggregate="views"]').count(),1);assert.equal(await page.locator('[data-aggregate="issues"]').count(),1);
     await page.selectOption('#scope-filter','all');assert.equal(await page.inputValue('[data-slot="0"]'),'views');
     await page.click('#settings');await page.selectOption('#card-metric-0','stars');await page.click('#preferences-form button[type="submit"]');assert.match(await page.locator('#preferences-message').textContent(),/different/);
     await page.selectOption('#card-metric-0','commits');await page.selectOption('#card-metric-2','views');await page.click('#preferences-form button[type="submit"]');await page.keyboard.press('Escape');
@@ -99,6 +99,7 @@ test('frontend contract and responsive interactions',async t=>{
   });
   await t.test('cumulative defaults, mode switches all charts and persists without changing counts',async()=>{
     assert.equal(await page.getAttribute('[data-chart-mode="cumulative"]','aria-pressed'),'true');
+    await page.click('[data-star-mode="gained"]');
     const row=page.locator('[data-project="one"] [data-metric="stars"]');
     const initial=await row.locator('.chart-line').getAttribute('d');
     assert.match(await row.locator('.spark-caption').textContent(),/Cumulative stars gained/);
@@ -381,7 +382,8 @@ test('repository settings retain supported but unobserved row choices',async t=>
   assert.deepEqual(await page.locator('[data-row-setting]').evaluateAll(es=>es.map(e=>e.dataset.rowSetting).sort()),Object.keys(CARD_METRICS).sort());
   assert.equal(await page.isChecked('[data-row-setting="clones"]'),true);
   await page.uncheck('[data-row-setting="views"]');await save();
-  assert.equal(await page.locator('#cards [data-metric="clones"]').count(),0,'unobserved graph stays hidden');
+  assert.equal(await page.locator('#cards [data-metric="clones"]').count(),dashboard.repos.length,'configured missing graph keeps its column');
+  assert.ok((await page.locator('#cards [data-metric="clones"] .unavailable-label').allTextContents()).every(text=>text==='Not collected yet'));
   const saved=await page.evaluate(()=>JSON.parse(localStorage.getItem('github-observatory-preferences')));
   assert.ok(saved.rowKeys.includes('clones'));assert.ok(!saved.rowKeys.includes('views'));
   await reopen();assert.equal(await page.isChecked('[data-row-setting="clones"]'),true);await page.keyboard.press('Escape');
@@ -499,6 +501,7 @@ test('actionable drill-downs, accessibility, pagination and request isolation',a
       assert.equal(await page.locator('.contribution-table .metric-action').count(),4);await close();
     }
     await page.selectOption('[data-slot="0"]','commits');
+    await page.click('[data-star-mode="gained"]');
     await page.click('[data-aggregate="stars"] .aggregate-value');
     assert.match(await page.locator('.cohort-note').textContent(),/3 of 4 count contributors/);
     assert.match(await page.locator('.contribution-table').textContent(),/Count only/);

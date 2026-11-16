@@ -22,6 +22,11 @@ dialog{background:var(--panel);color:var(--text);border:1px solid var(--line);bo
 #repository-graphs{scroll-margin-top:86px}
 /* A saved label preference applies equally to desktop and mobile rows. */
 #cards.hide-graph-labels .spark-label{display:none}
+/* Missing observations are neutral placeholders, never a zero-valued series. */
+.metric-placeholder{display:flex;position:relative;flex-direction:column;justify-content:center;align-items:stretch;gap:5px;width:100%;height:100%;color:var(--muted)}
+.unavailable-baseline{display:block;border-top:1px solid var(--muted);opacity:.5;width:100%}
+.unavailable-label{display:block;font-size:10px;line-height:1.2;white-space:normal;overflow-wrap:anywhere;text-align:left}
+.spark-metric:has(.metric-placeholder){color:var(--muted)}
 /* Drill-downs keep charts quiet and put actionable records first. */
 .aggregate-value,.chart-button,.detail-count{border:0;background:transparent;padding:0;text-align:left;border-radius:3px}
 .aggregate-value:hover,.chart-button:hover,.detail-count:hover{background:color-mix(in srgb,var(--ink) 5%,transparent)}

@@ -157,7 +157,7 @@ test('repository rows repeat metric labels by default and persist the optional s
   await page.click('#settings');assert.equal(await page.isChecked('#show-graph-labels'),false);await page.check('#show-graph-labels');await page.click('#preferences-form button[type=submit]');await page.keyboard.press('Escape');
   for(const label of await labels.all())assert.equal(await label.isVisible(),true);
   await page.reload();await page.waitForSelector('.project-card');for(const label of await labels.all())assert.equal(await label.isVisible(),true);
-  await page.click('.project-name');assert.equal(await page.locator('#pause').isVisible(),true);assert.equal(await page.locator('#detail .visibility-icon').getAttribute('aria-label'),'Private repository');assert.equal(await page.locator('#detail [data-detail-metric]').count(),4);
+  await page.click('.project-name');assert.equal(await page.locator('#pause').isVisible(),true);assert.equal(await page.locator('#detail .visibility-icon').getAttribute('aria-label'),'Private repository');assert.equal(await page.locator('#detail [data-detail-metric]').count(),8);
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
 });
 

@@ -36,11 +36,11 @@ test('metric actions use safe repository destinations and honest date semantics'
 const metric=(kind,value,values)=>({label:'Stars',kind,unit:'stars',value,delta:null,points:dates.map((date,i)=>({date,value:values[i]})),coverage:{start:dates[0],end:dates[2],complete:true},lastSuccess:'2026-01-03T12:00:00Z'});
 test('one Stars metric keeps current count distinct from its daily-gains graph',()=>{
  const raw={id:'a',metrics:{stars:metric('balance',100,[null,null,100]),star_activity:metric('event',5,[2,0,3])}};
- const r=presentRepository(raw);
+ const r=presentRepository(raw,'gained');
  assert.deepEqual(Object.keys(r.metrics),['stars']);assert.equal(r.metrics.stars.value,100);
  assert.deepEqual(r.metrics.stars.points.map(p=>p.value),[2,0,3]);assert.equal(r.metrics.stars.kind,'balance');assert.equal(r.metrics.stars.chartKind,'event');
  assert.equal(raw.metrics.stars.points[2].value,100);assert.ok(raw.metrics.star_activity);
- const total=aggregate([r,presentRepository({...raw,id:'b'})],'stars',dates);
+ const total=aggregate([r,presentRepository({...raw,id:'b'},'gained')],'stars',dates);
  assert.equal(total.value,200);assert.deepEqual(total.points.map(p=>p.value),[4,0,6]);assert.equal(total.chartKind,'event');
  const fallback=presentRepository({id:'c',metrics:{stars:metric('balance',50,[null,null,50])}});
  assert.equal(fallback.metrics.stars.chartKind,undefined);assert.equal(aggregate([r,fallback],'stars',dates).value,150);assert.equal(aggregate([r,fallback],'stars',dates).chartContributors.length,1);
@@ -68,8 +68,8 @@ test('aggregate coverage never upgrades authoritative partial coverage',()=>{
 });
 test('unified Stars and aggregates preserve independent graph failure and coverage',()=>{
  const raw={id:'a',metrics:{stars:{...metric('balance',100,[null,null,100]),status:'ok',source:'Metadata'},star_activity:{...metric('event',5,[2,0,3]),status:'ok',source:'Daily star history'}}};
- const good=presentRepository(raw);
- const failed=presentRepository({...raw,id:'b',metrics:{...raw.metrics,star_activity:{...raw.metrics.star_activity,status:'error',lastSuccess:'2026-01-02T12:00:00Z',coverage:{...raw.metrics.star_activity.coverage,complete:false}}}});
+ const good=presentRepository(raw,'gained');
+ const failed=presentRepository({...raw,id:'b',metrics:{...raw.metrics,star_activity:{...raw.metrics.star_activity,status:'error',lastSuccess:'2026-01-02T12:00:00Z',coverage:{...raw.metrics.star_activity.coverage,complete:false}}}},'gained');
  assert.equal(failed.metrics.stars.status,'ok');assert.equal(failed.metrics.stars.chartStatus,'error');assert.equal(failed.metrics.stars.chartSource,'Daily star history');
  const total=aggregate([good,failed],'stars',dates);
  assert.equal(total.value,200);assert.equal(total.status,'ok');assert.equal(total.chartStatus,'error');
@@ -86,7 +86,7 @@ test('cumulative view sums observed events within the range without filling gaps
 test('balance graphs are never summed; unified Stars accumulates only gains',()=>{
  const balance=metric('balance',8,[5,7,8]);
  assert.deepEqual(chartView(balance,dates,'cumulative').points.map(p=>p.value),[5,7,8]);assert.equal(chartView(balance,dates,'cumulative').label,'Observed balance');
- const stars=presentRepository({metrics:{stars:balance,star_activity:metric('event',5,[2,0,3])}}).metrics.stars;
+ const stars=presentRepository({metrics:{stars:balance,star_activity:metric('event',5,[2,0,3])}},'gained').metrics.stars;
  assert.deepEqual(chartView(stars,dates,'cumulative').points.map(p=>p.value),[2,2,5]);assert.equal(stars.value,8);assert.equal(chartView(stars,dates,'cumulative').label,'Cumulative stars gained');
  assert.equal(chartView(stars,dates,'daily').label,'Daily stars gained');
 });

@@ -18,6 +18,23 @@ const DEFINITIONS = {
   star_activity: ['Star activity', 'event', 'stars', 'GitHub stargazers/history; provider-defined daily boundaries, not guaranteed UTC'],
 };
 const safe = (message, statusCode = 400, code = 'invalid') => Object.assign(new Error(message), { safeMessage: message, statusCode, code });
+// Public explanations are trusted constants, never provider messages.
+const AVAILABILITY_LABELS = Object.freeze({
+  available: 'Available', disabled: 'Disabled on repo', no_access: 'No access',
+  not_collected: 'Not collected yet', error: 'Collection failed', empty_repository: 'No commits yet',
+});
+function metricAvailability(key, row, outcome, latest) {
+  let state;
+  if (key === 'issues' && row.has_issues === 0) state = 'disabled';
+  else if (['forbidden', 'unauthorized', 'credentials_missing'].includes(outcome?.status)) state = 'no_access';
+  else if (key === 'commits' && outcome?.status === 'empty_repository') state = 'empty_repository';
+  else if (outcome && !['ok', 'collecting', 'not_collected'].includes(outcome.status)) state = 'error';
+  else if (latest) state = 'available';
+  else state = 'not_collected';
+  const label = state === 'not_collected' && outcome?.status === 'ok' ? 'No observations yet'
+    : state === 'not_collected' && outcome?.status === 'collecting' ? 'Collection in progress' : AVAILABILITY_LABELS[state];
+  return { state, label };
+}
 const isoDay = date => new Date(date).toISOString().slice(0, 10);
 const text = (value, max = 200) => typeof value === 'string' ? value.replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, max) : null;
 const nonnegative = n => Number.isSafeInteger(n) && n >= 0;
@@ -113,7 +130,7 @@ function normalizeRepository(value) {
   let names;
   try { names = repositoryName(`${value.owner?.login}/${value.name}`); } catch { throw safe('Invalid upstream metadata.', 502, 'invalid_response'); }
   if (typeof value.default_branch !== 'string' || !value.default_branch.length || value.default_branch.length > 255) throw safe('Invalid upstream metadata.', 502, 'invalid_response');
-  return { id: String(value.id), ...names, visibility: value.private ? 'private' : 'public', archived: value.archived, language: text(value.language, 100), description: text(value.description, 500), branch: value.default_branch, stars: value.stargazers_count, forks: value.forks_count };
+  return { id: String(value.id), ...names, visibility: value.private ? 'private' : 'public', archived: value.archived, language: text(value.language, 100), description: text(value.description, 500), branch: value.default_branch, stars: value.stargazers_count, forks: value.forks_count, hasIssues: typeof value.has_issues === 'boolean' ? Number(value.has_issues) : null };
 }
 function datesBetween(start, end) {
   const dates = [];
@@ -219,7 +236,12 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
         SELECT events.*,event_context.occurred_at,event_context.observed_at,event_context.source,event_context.context
         FROM events LEFT JOIN event_context ON events.id=event_context.event_id
         UNION ALL SELECT * FROM activity_feed WHERE NOT EXISTS (SELECT 1 FROM events WHERE events.id=activity_feed.id);
-      PRAGMA user_version=2;`);
+      `);
+    // Nullable capability: legacy rows are unknown, never implicitly disabled.
+    if (!db.prepare('PRAGMA table_info(repositories)').all().some(column => column.name === 'has_issues')) {
+      db.exec('ALTER TABLE repositories ADD COLUMN has_issues INTEGER CHECK(has_issues IN (0,1));');
+    }
+    db.exec('PRAGMA user_version=3;');
     // Include recovery in initialization cleanup: a failed UPDATE must not leak
     // either database handle or the lifetime writer lock.
     db.prepare("UPDATE runs SET status='interrupted', message='Collection interrupted; previous observations retained.' WHERE status='collecting'").run();
@@ -343,10 +365,11 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
     return { items, complete: false };
   }
   function storeRepository(repo, access, alias, at, resume) {
-    db.prepare(`INSERT INTO repositories(id,owner,name,visibility,archived,language,description,branch,access) VALUES(?,?,?,?,?,?,?,?,?)
+    db.prepare(`INSERT INTO repositories(id,owner,name,visibility,archived,language,description,branch,access,has_issues) VALUES(?,?,?,?,?,?,?,?,?,?)
       ON CONFLICT(id) DO UPDATE SET owner=excluded.owner,name=excluded.name,visibility=excluded.visibility,archived=excluded.archived,
       language=excluded.language,description=excluded.description,branch=excluded.branch,access=excluded.access,
-      paused=CASE WHEN ? THEN 0 ELSE repositories.paused END`).run(repo.id, repo.owner, repo.name, repo.visibility, Number(repo.archived), repo.language, repo.description, repo.branch, access, Number(resume));
+      has_issues=COALESCE(excluded.has_issues,repositories.has_issues),
+      paused=CASE WHEN ? THEN 0 ELSE repositories.paused END`).run(repo.id, repo.owner, repo.name, repo.visibility, Number(repo.archived), repo.language, repo.description, repo.branch, access, repo.hasIssues, Number(resume));
     for (const name of [alias, repo.full]) db.prepare('INSERT INTO aliases(alias,repo_id) VALUES(?,?) ON CONFLICT(alias) DO UPDATE SET repo_id=excluded.repo_id').run(name.toLowerCase(), repo.id);
     for (const metric of ['stars', 'forks']) {
       if (nonnegative(repo[metric])) { putPoint(repo.id, metric, isoDay(at), repo[metric], at); run(repo.id, metric, 'ok', at, 'Observed repository balance.'); }
@@ -368,11 +391,12 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
     const { start, end } = dateWindow(range);
     const dates = datesBetween(start, end);
     const repos = db.prepare('SELECT * FROM repositories WHERE paused=0 ORDER BY lower(owner),lower(name)').all().map(row => {
-      const metrics = {};
+      const metrics = {}, availability = {};
       const records = db.prepare('SELECT * FROM runs WHERE repo_id=?').all(row.id);
       for (const [key, [label, kind, unit, source]] of Object.entries(DEFINITIONS)) {
         const outcome = records.find(item => item.metric === key);
         const latest=db.prepare('SELECT day,value,observed_at FROM points WHERE repo_id=? AND metric=? AND day<=? ORDER BY day DESC LIMIT 1').get(row.id,key,end);
+        availability[key] = metricAvailability(key, row, outcome, latest);
         if(!latest)continue;
         const observations = db.prepare('SELECT day,value FROM points WHERE repo_id=? AND metric=? AND day>=? AND day<=? ORDER BY day').all(row.id, key, start, end);
         const byDay = new Map(observations.map(point => [point.day, point.value]));
@@ -383,7 +407,7 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
           coverage: { start: observations[0]?.day ?? null, end: observations.at(-1)?.day ?? null, complete }, status: row.paused ? 'paused' : outcome?.status ?? 'not_collected', lastSuccess: outcome?.last_success ?? null, source };
       }
       const lastActivityAt = db.prepare('SELECT MAX(occurred_at) AS at FROM activity_records WHERE repo_id=? AND occurred_at<=?').get(row.id, clock().toISOString()).at;
-      return { ...publicRepo(row), metrics, ...(lastActivityAt ? { lastActivityAt } : {}) };
+      return { ...publicRepo(row), metrics, metricAvailability: availability, ...(lastActivityAt ? { lastActivityAt } : {}) };
     });
     return { dates, repos, updatedAt: getState('updatedAt'), collecting: Boolean(flight), credentialConfigured: Boolean(token) };
   }
@@ -682,6 +706,10 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
       putEvents(row.id, 'releases', values, start, end, at);
     });
     await perform('issues', async () => {
+      if (db.prepare('SELECT has_issues FROM repositories WHERE id=?').get(row.id).has_issues === 0) {
+        run(row.id, 'issues', 'disabled', at, 'Disabled on repo; previous observations retained.');
+        return;
+      }
       const items = incomplete(await pages(`${route}/issues`, { state: 'open', sort: 'created', direction: 'asc' }, row.access, context));
       const issues = new Map();
       for (const item of items) {

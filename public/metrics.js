@@ -4,7 +4,7 @@ export const escapeHTML = value => String(value ?? '').replace(/[&<>"']/g, c => 
 export const fmt = value => finite(value) ? new Intl.NumberFormat().format(value) : '';
 export const observed = metric => metric && (finite(metric.value) || metric.points?.some(p => finite(p.value)));
 export const keys = repo => Object.keys(repo.metrics || {}).filter(k => observed(repo.metrics[k]));
-export const collectionProblem=status=>/^(error|failed|failure|rate_limited|rate-limited|forbidden|unauthorized|unavailable|upstream_error|invalid_response|network_error|timeout|partial|budget_exhausted|unsupported)$/.test(status||'');
+export const collectionProblem=status=>/^(disabled|no_access|credentials_missing|error|failed|failure|rate_limited|rate-limited|forbidden|unauthorized|unavailable|upstream_error|invalid_response|network_error|timeout|partial|budget_exhausted|unsupported)$/.test(status||'');
 function combinedStatus(values){const states=values.filter(Boolean);return states.find(collectionProblem)||states.find(s=>s==='collecting')||states[0]||null;}
 export const CARD_METRICS=Object.freeze({commits:'Commits',stars:'Stars',views:'Views',issues:'Open issues',forks:'Forks',merged_prs:'Merged PRs',releases:'Releases',clones:'Clones'});
 export const DEFAULT_CHART_KEYS=Object.freeze(['commits','stars','views','issues']);
@@ -33,12 +33,33 @@ export function issueLevel(value, thresholds) {
 }
 // One presentation metric, two explicitly different measurements. Raw storage
 // still keeps outstanding-star balances and star-creation activity separate.
-export function presentRepository(repo) {
-  const {star_activity:activity,...metrics}=repo.metrics || {};
-  if(observed(metrics.stars) && activity?.points?.some(p=>finite(p.value))){
-    metrics.stars={...metrics.stars,points:activity.points,chartKind:'event',chartLabel:'Daily stars gained',chartCoverage:activity.coverage,chartSource:activity.source,chartLastSuccess:activity.lastSuccess,chartStatus:activity.status};
+export function unavailableReason(repo,key) {
+  const labels={disabled:'Disabled on repo',no_access:'No access',not_collected:'Not collected yet',error:'Collection failed',empty_repository:'No commits yet'};
+  const {state,label}=repo.metricAvailability?.[key]||{};
+  if(state==='not_collected'&&['No observations yet','Collection in progress'].includes(label))return label;
+  return Object.hasOwn(labels,state)?labels[state]:'Not collected yet';
+}
+// Current collection health is independent of retained observation availability.
+export function collectionWarning(repo,key){
+  const state=repo.metricAvailability?.[key]?.state,status=repo.metrics?.[key]?.status;
+  if(['disabled','no_access','error'].includes(state))return unavailableReason(repo,key);
+  if(status==='disabled')return 'Disabled on repo';
+  if(['no_access','forbidden','unauthorized','credentials_missing'].includes(status))return 'No access';
+  return collectionProblem(status)?'Collection failed':'';
+}
+export function missingMetric(repo,key) {
+  return {label:CARD_METRICS[key],value:null,points:[],unit:'',unavailableReason:unavailableReason(repo,key)};
+}
+export function presentRepository(repo,starMode='total') {
+  const rawMetrics=repo.rawMetrics || repo.metrics || {},{star_activity:activity,...metrics}=rawMetrics;
+  if(observed(metrics.stars)){
+    metrics.stars={...metrics.stars,starMode,countLabel:'Total stars'};
+    if(starMode==='gained')metrics.stars={...metrics.stars,points:activity?.points||[],chartKind:'event',chartLabel:'Daily stars gained',chartCoverage:activity?.coverage||{start:null,end:null,complete:false},chartSource:activity?.source,chartLastSuccess:activity?.lastSuccess,chartStatus:activity?.status,
+      chartUnavailableReason:activity?.points?.some(p=>finite(p.value))?null:observed(activity)?'No observations in this range':unavailableReason(repo,'star_activity')};
   }
-  return {...repo,metrics};
+  // Preserve legacy event ordering even when the public Stars graph is a balance.
+  const lastActivityAt=Object.hasOwn(repo,'lastActivityAt')?repo.lastActivityAt:new Date(repositoryActivity({...repo,metrics:rawMetrics})).toISOString();
+  return {...repo,lastActivityAt,rawMetrics,metrics};
 }
 export function githubURL(value) {
   try { const u = new URL(value); return u.protocol === 'https:' && u.hostname === 'github.com' && !u.port && !u.username && !u.password ? u.href : null; } catch { return null; }
@@ -63,6 +84,14 @@ export function aligned(metric, dates) {
   const points = new Map((metric.points || []).map(p => [p.date, p.value]));
   return dates.map(date => ({date, value: finite(points.get(date)) ? points.get(date) : null}));
 }
+function observationDay(value){
+  if(typeof value!=='string'||!/^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))?$/.test(value))return null;
+  const time=Date.parse(value);
+  return Number.isFinite(time)?new Date(time).toISOString().slice(0,10):null;
+}
+function latestBalanceDay(metric){
+  return observationDay(metric.observedAt)||(metric.points||[]).filter(p=>finite(p.value)).map(p=>observationDay(p.date)).filter(Boolean).sort().at(-1)||null;
+}
 // A fixed cohort prevents a changing contributor set from inventing movement.
 // Event totals require identical observed-day masks; balance totals require the
 // same latest observation date. Detail exposes the selected cohort and coverage.
@@ -80,16 +109,19 @@ export function aggregate(repos, key, dates) {
     groups.get(signature).push({repo,metric:m,points});
   }
   let candidates=[...groups.values()];
-  if(key==='stars'&&candidates.some(c=>c[0].metric.chartKind==='event'))candidates=candidates.filter(c=>c[0].metric.chartKind==='event');
-  const cohort=candidates.sort((a,b)=>b.length-a.length||b[0].points.filter(p=>finite(p.value)).length-a[0].points.filter(p=>finite(p.value)).length)[0]||[];
+  if(key==='stars'&&counted.some(x=>x.metric.chartKind==='event'))candidates=candidates.filter(c=>c[0].metric.chartKind==='event');
+  const totalStars=key==='stars'&&counted.length>0&&counted.every(x=>(x.metric.chartKind||x.metric.kind)==='balance');
+  // Total stars must use ALL headline contributors, even with differing starts.
+  const cohort=totalStars?counted.map(x=>({...x,points:aligned(x.metric,dates)})):candidates.sort((a,b)=>b.length-a.length||b[0].points.filter(p=>finite(p.value)).length-a[0].points.filter(p=>finite(p.value)).length)[0]||[];
   if(!cohort.length && !(key==='stars'&&counted.length))return null;
   const totals=key==='stars'?counted:cohort,first=(cohort[0]||totals[0]).metric;
   const points=dates.map((date,i)=>({date,value:cohort.length&&cohort.every(x=>finite(x.points[i].value))?cohort.reduce((sum,x)=>sum+x.points[i].value,0):null}));
   const coverage={start:points.find(p=>finite(p.value))?.date??null,end:points.findLast(p=>finite(p.value))?.date??null,complete:cohort.length>0&&points.length>0&&points.every(p=>finite(p.value))&&cohort.every(x=>(x.metric.chartCoverage||x.metric.coverage)?.complete===true)};
   return {...first,status:combinedStatus(totals.map(x=>x.metric.status)),
+    ...(key==='stars'&&first.chartKind==='event'&&!cohort.length?{chartUnavailableReason:[...new Set(totals.map(x=>x.metric.chartUnavailableReason||'No observations in this range'))].join(' · ')}:{}),
     ...(first.chartKind?{chartCoverage:coverage,chartStatus:combinedStatus(cohort.map(x=>x.metric.chartStatus)),chartLastSuccess:cohort.map(x=>x.metric.chartLastSuccess).filter(Boolean).sort()[0]??null,chartSource:[...new Set(cohort.map(x=>x.metric.chartSource).filter(Boolean))].join('; ')}:{}),
     value:totals.reduce((s,x)=>s+x.metric.value,0),delta:totals.every(x=>finite(x.metric.delta)&&x.metric.coverage?.complete)?totals.reduce((s,x)=>s+x.metric.delta,0):null,
-    points,coverage,
+    points,coverage,chartComparable:!totalStars||!!latestBalanceDay(first)&&cohort.every(x=>latestBalanceDay(x.metric)===latestBalanceDay(first)),
     contributors:totals.map(x=>x.repo),chartContributors:cohort.map(x=>x.repo),lastSuccess:totals.map(x=>x.metric.lastSuccess).filter(Boolean).sort()[0]??null};
 }
 export function chartView(metric,dates,mode='cumulative') {
@@ -97,7 +129,7 @@ export function chartView(metric,dates,mode='cumulative') {
   let total=0;
   return {points:cumulative?points.map(p=>({...p,value:finite(p.value)?(total+=p.value):null})):points,
     kind:cumulative?'balance':metric.chartKind||metric.kind,
-    label:event?(metric.chartLabel?metric.chartLabel.replace(/^Daily /,cumulative?'Cumulative ':'Daily '):cumulative?'Cumulative in range':'Daily observations'):'Observed balance',
+    label:event?(metric.chartLabel?metric.chartLabel.replace(/^Daily /,cumulative?'Cumulative ':'Daily '):cumulative?'Cumulative in range':'Daily observations'):metric.starMode==='total'?'Total stars · observed balance':'Observed balance',
     cumulative};
 }
 export function chart(points, {small=false,kind='balance',compact=false,width=390}={}) {
@@ -134,6 +166,6 @@ export function csvCell(value) {
 }
 export function exportCSV(repos,range) {
   const rows=[['repository','metric','value','unit','range','coverage_start','coverage_end','coverage_complete','last_success']];
-  for(const r of repos)for(const key of keys(r)){const m=r.metrics[key];rows.push([r.owner+'/'+r.name,m.label,m.value,m.unit,range,m.coverage?.start,m.coverage?.end,m.coverage?.complete,m.lastSuccess]);}
+  for(const r of repos)for(const key of keys(r)){const m=r.rawMetrics?.[key]||r.metrics[key];rows.push([r.owner+'/'+r.name,m.label,m.value,m.unit,range,m.coverage?.start,m.coverage?.end,m.coverage?.complete,m.lastSuccess]);}
   return rows.map(row=>row.map(csvCell).join(',')).join('\r\n');
 }
