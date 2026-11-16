@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
 import { createObservatory } from '../src/data.mjs';
 import { createServer } from '../src/server.mjs';
@@ -10,7 +11,7 @@ const NOW = '2026-06-20T12:00:00.000Z';
 const metadata = { id: 101, owner: { login: 'example' }, name: 'sample', private: false, archived: false, default_branch: 'main', stargazers_count: 0, forks_count: 2 };
 const keys = ['commits', 'stars', 'forks', 'merged_prs', 'releases', 'issues', 'views', 'clones', 'star_activity'];
 async function fixture(t) {
-  const dir = await mkdtemp(join(process.env.TMPDIR, 'availability-test-'));
+  const dir = await mkdtemp(join(tmpdir(), 'availability-test-'));
   const state = { metadata: { ...metadata }, endpoints: {}, now: NOW };
   const calls = [];
   const config = { dbPath: join(dir, 'test.sqlite'), token: 'synthetic-test-token', now: () => new Date(state.now), fetchImpl: async (input, init) => {
