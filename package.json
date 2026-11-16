@@ -1,0 +1,20 @@
+{
+  "name": "github-observatory",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A self-hosted GitHub repository observatory with persistent history and compact, elegant project graphs.",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "node src/main.mjs",
+    "open": "node scripts/open.mjs",
+    "test": "node --test test/*.test.mjs",
+    "test:ui": "node test/ui.test.mjs",
+    "check": "node scripts/privacy-check.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.65.1"
+  }
+}
