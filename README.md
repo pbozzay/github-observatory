@@ -1,8 +1,22 @@
 # Github Observatory
 
-A local-first GitHub analytics dashboard: overall trends above elegant, horizontal repository rows, with a small history graph beneath each count. Public watches and explicitly selected private repositories share one view. SQLite retains observations beyond GitHub's short traffic window.
+A self-hosted GitHub analytics dashboard: four configurable overview cards above elegant repository rows, with compact history graphs and actionable drill-down tables. Public watches and explicitly selected private repositories share one view. SQLite retains observations beyond GitHub's short traffic window.
 
-**Local pilot.** This is a working application under active review, not a hosted analytics service. It does not publish repository data or send telemetry. Public source code does not make your running dashboard or database public.
+Your data stays on your server. There is no telemetry, hosted analytics account, or demo-data fallback in the application. Publishing this source does **not** publish your dashboard or database.
+
+## A look inside
+
+**Every project, count, and activity item in these screenshots is synthetic.** The isolated screenshot generator never reads a real database or account.
+
+![Dashboard showing synthetic projects and cumulative activity](docs/screenshots/dashboard.png)
+
+![Open-issue drill-down with synthetic issue records and action links](docs/screenshots/issues-modal.png)
+
+<details><summary>Mobile layout</summary>
+
+![Mobile dashboard with synthetic data](docs/screenshots/mobile.png)
+
+</details>
 
 ## Run locally
 
@@ -13,63 +27,75 @@ npm ci
 npm start
 ```
 
-In another terminal, open the project and run:
+In another terminal in the project:
 
 ```sh
 npm run open
 ```
 
-The server listens only on `127.0.0.1:47831`. The opener reads an owner-only local unlock file, opens your browser, and the page immediately removes the temporary handoff fragment from the address bar. The resulting session uses an HttpOnly, SameSite=Strict cookie. The unlock key is never printed or stored in browser localStorage.
+The default server listens only on `127.0.0.1:47831`. The opener reads an owner-only local unlock file, opens your browser, and immediately removes the temporary handoff fragment from the address bar. The resulting session uses an HttpOnly, SameSite=Strict cookie. The unlock key is never printed or stored in browser localStorage.
 
-To use a GitHub fine-grained token, create a file **outside this source checkout**, readable only by your user. Do not paste credentials into the dashboard, README, shell command history or a GitHub issue. Configure its path:
+To use a GitHub fine-grained token, create a file **outside this checkout**, readable only by its owner. Do not paste credentials into the dashboard, command history, or a GitHub issue. Configure its path:
 
 ```sh
 export GITHUB_TOKEN_FILE=/absolute/path/to/owner-only-token-file
 npm start
 ```
 
-The existing token is optional for public watches. It stays server-side; the application does not read GitHub CLI credentials or request additional permissions. Connections lists owned repositories available to the configured token; private repositories are added only through explicit selection. A token-mode access failure never falls back to an anonymous private-repository request.
+The token is optional for public watches and stays server-side. The app never reads GitHub CLI credentials or requests additional permissions. Settings lists owned repositories available to the configured token; private repositories are added only through explicit selection. Token-mode failures never fall back to anonymous requests.
 
-Configuration:
+### Configuration
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `OBSERVATORY_PORT` | `47831` | Local listening port |
-| `OBSERVATORY_DATA_DIR` | `~/.local/share/github-observatory` | Private SQLite, unlock file and runtime state; must be outside source |
+| `OBSERVATORY_PORT` | `47831` (`8080` in the image) | Listening port |
+| `OBSERVATORY_DATA_DIR` | `~/.local/share/github-observatory` (`/data` in the image) | Private SQLite and runtime state; outside source |
 | `GITHUB_TOKEN_FILE` | unset | Owner-only scoped token file |
+| `OBSERVATORY_BIND_HOST` | `127.0.0.1` | Set `0.0.0.0` only with the secured proxy configuration below |
+| `OBSERVATORY_PUBLIC_ORIGIN` | unset | Exact HTTPS origin, without a trailing slash |
+| `OBSERVATORY_PROXY_KEY_FILE` | unset | Owner-only random key shared with the authenticated reverse proxy |
 
-Use the same `OBSERVATORY_DATA_DIR` when starting and opening the app. Do not expose this pilot with a tunnel, LAN bind or reverse proxy. Remote deployment and container packaging require their own authentication/routing acceptance checks.
+Use the same data directory when starting and opening a local instance. For Docker/Unraid, follow the [deployment and backup guide](docs/deployment.md); do not simply expose the local port.
+
+## Drill down, then act
+
+- Click any overview card, count, or chart to see its repository contributions and daily observation table.
+- Click a repository metric or sparkline to open its data modal. Commit, merged-PR, release, and current open-issue records link to the corresponding GitHub objects when collected.
+- Open-issue records describe the latest complete **current snapshot**, not the historic state at the selected chart date. Collection failures retain the prior snapshot and remain visible.
+- Metrics without individual records show actual observations plus appropriate GitHub destinations: stargazers, forks, traffic, and repository activity. Counts are never turned into invented records.
+- Tables preserve raw daily values even in Cumulative mode. Unknown is not zero. Pagination, incomplete coverage, and stale observations are explicitly identified.
+- Repository names still open a full history view. Modals support keyboard access, Escape, focus restoration, and mobile scrolling.
 
 ## Data, not demo numbers
 
-- The browser loads persisted observations from the local API. There is no demo-data fallback.
-- Current stars/forks are observed balances. They are not reconstructed historical balances.
-- GitHub-reported star activity, when available, is distinct from current stars; provider date semantics may differ from UTC.
-- Commits, merged pull requests, releases and authorized traffic are collected within bounded provider windows.
-- Older balance observations remain visible when selecting a shorter chart window; their collection time remains available in metric details.
-- Missing series are omitted. Unknown days remain gaps; actual observed zero is retained. An initial balance observation is one point, not an invented flat history.
-- Partial history does not support an unqualified growth comparison. Collection diagnostics retain access, pagination and rate-limit outcomes without replacing good data with zeros.
+- Current stars/forks are observed balances, not reconstructed historical balances. Stars shows the observed count above a daily/cumulative **stars gained** graph when provider history exists; it does not subtract unstarring. A narrower aggregate graph cohort is identified separately from the count cohort.
+- Four cards default to **Commits, Stars, Views, Open issues**. Settings and on-card selectors persist your choices in the browser. Unavailable selected metrics are omitted, not replaced with unrelated ones.
+- Open-issue counts turn yellow strictly above **1**, red strictly above **3**. Thresholds are configurable; pull requests are excluded from issue counts.
+- Graphs default to **Cumulative**. Event totals accumulate within the selected range; balances are never summed again. The Daily toggle is remembered. Tables and CSV retain raw values.
+- Event fills use a zero baseline; missing days remain gaps. An initial balance observation is one point, not an invented flat history. Older retained balances keep their collection timestamp even outside a shorter chart window.
+- Partial history does not support an unqualified growth comparison. Diagnostics retain permission, pagination, and rate-limit failures without replacing good data with zeros.
 - Daily traffic totals can be summed; daily unique visitors are not summed and called unique people.
-- Public and authenticated request budgets are separate and persisted. Deferred repositories and metric families rotate across cycles rather than starving later watches.
-- The hourly scheduler lives inside the app process. Closing the app stops it; no operating-system job or cloud scheduler is installed.
+- Public and authenticated budgets are separate and persisted. Deferred repositories and metric families rotate across cycles.
+- Collection runs hourly inside the app process. No separate operating-system or cloud scheduler is required.
 
 ## Security boundaries
 
-All data-bearing APIs require the local session. Mutations require an exact same-origin request and CSRF token. Host validation protects against DNS rebinding; unrelated filesystem paths cannot be served. Responses are non-cacheable, assets are self-hosted, and no third-party analytics/scripts are loaded. Repository text must be treated as untrusted content.
+All data-bearing APIs require a session. Mutations require an exact same-origin request and CSRF token. Host validation protects against DNS rebinding. Responses are non-cacheable, assets self-hosted, and repository text is untrusted content.
 
-This protects a local browser workflow, not against a malicious process already running as your operating-system user. That user can read the local unlock and token files. Keep the database and backups private: repository names and activity can be sensitive even without code or credentials.
+Remote mode additionally requires an authenticated HTTPS reverse proxy to **overwrite** `X-Observatory-Proxy-Key` with a random secret. Every external request must carry the correct key and configured host. The browser never receives that key; the proxy's login grants the app session without a second unlock prompt. Cookies are Secure in remote mode. Forwarded headers alone grant no trust. Only a generic, loopback-only health probe bypasses the proxy gate.
 
-Never commit runtime state, live screenshots, collection logs, backups or real-account fixtures. `.gitignore`, the source-only release process and `npm run check` help enforce this boundary. The preflight is a heuristic, not a guarantee; independently review the exact staged tree before publishing.
+The reverse proxy is the remote identity boundary: protect **all paths**, including custom locations. Anyone admitted by its access policy can use this single-user application. Keep the backend private; do not publish the key or rely on a client-supplied header. This is not a multi-tenant authorization system.
+
+A malicious process running as the app's operating-system user can read its secrets and database. Keep state and backups private. Never commit real screenshots, logs, backups, or account fixtures. The privacy preflight permits only the three reviewed synthetic documentation images; it is a heuristic, not a substitute for reviewing the exact publication artifact.
 
 ## Development
 
 ```sh
+npm ci
+npx playwright install chromium
 npm test
 npm run check
+node scripts/screenshots.mjs
 ```
 
-Browser verification uses Playwright as a dev-only dependency. Install its Chromium browser, or configure `PLAYWRIGHT_CHROMIUM_EXECUTABLE` to an existing Chrome-compatible executable. Tests use synthetic repository data, never a production credential. See `docs/api-contract.md` for the module and HTTP contracts.
-
-## Scope and next steps
-
-The local pilot is deliberately isolated from any existing analytics installation. It does not migrate another database, alter a production hostname, create GitHub OAuth applications or broaden token permissions. Restore/cutover, Docker publishing, native server integration and externally authenticated hosting are separate release steps.
+Playwright is dev-only. Set `PLAYWRIGHT_CHROMIUM_EXECUTABLE` to an existing Chrome-compatible browser when needed. Tests and the reproducible screenshot harness use synthetic fixtures and no production credentials. See the [API contract](docs/api-contract.md) and [deployment guide](docs/deployment.md).

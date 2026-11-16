@@ -11,3 +11,8 @@ backups
 test-results
 playwright-report
 screenshots
+docs
+test
+scripts
+README.md
+package-lock.json

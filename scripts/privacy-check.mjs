@@ -11,12 +11,15 @@ const patterns=[
  ['personal host path',/\/(?:Users|home)\/[a-zA-Z][^\s/'"<>]*/],
  ['private LAN address',/\b192\.168\.\d{1,3}\.\d{1,3}\b/]
 ];
+// Only reviewed, reproducibly synthetic publication images belong in source.
+const demoImages=new Set(['docs/screenshots/dashboard.png','docs/screenshots/issues-modal.png','docs/screenshots/mobile.png']);
 const failures=[];let checked=0;
-function walk(dir){for(const name of readdirSync(dir)){if(ignored.has(name))continue;const path=join(dir,name),stat=lstatSync(path),rel=relative(root,path);if(stat.isSymbolicLink()){failures.push([rel,'symlink']);continue;}if(stat.isDirectory()){if(['data','state','private','backups','screenshots'].includes(name))failures.push([rel,'runtime/artifact directory']);else walk(path);continue;}
+function walk(dir){for(const name of readdirSync(dir)){if(ignored.has(name))continue;const path=join(dir,name),stat=lstatSync(path),rel=relative(root,path);if(stat.isSymbolicLink()){failures.push([rel,'symlink']);continue;}if(stat.isDirectory()){if(['data','state','private','backups','screenshots'].includes(name)&&rel!=='docs/screenshots')failures.push([rel,'runtime/artifact directory']);else walk(path);continue;}
+ if(demoImages.has(rel)){const bytes=readFileSync(path);checked++;if(stat.size>2*1024*1024||!bytes.subarray(0,8).equals(Buffer.from([137,80,78,71,13,10,26,10])))failures.push([rel,'invalid demo PNG']);continue;}
  if(/\.(?:db|sqlite|log|pem|key|token|png|jpg|zip)(?:[-.]|$)/i.test(name)||(/^\.env/.test(name)&&name!=='.env.example')){failures.push([rel,'private/artifact file']);continue;}
  if(stat.size>2*1024*1024){failures.push([rel,'unexpected large file']);continue;}
  const text=readFileSync(path,'utf8');checked++;
  for(const [label,regex] of patterns)if(regex.test(text))failures.push([rel,label]);
 }}
 walk(root);
-if(failures.length){for(const [path,label] of failures)console.error(`${path}: ${label} (value withheld)`);process.exitCode=1;}else console.log(`Privacy preflight passed for ${checked} source files. Runtime state, screenshots and credentials must stay outside this tree.`);
+if(failures.length){for(const [path,label] of failures)console.error(`${path}: ${label} (value withheld)`);process.exitCode=1;}else console.log(`Privacy preflight passed for ${checked} source files. Runtime state, real screenshots and credentials must stay outside this tree. Allowlisted demo images require synthetic-generator and human review.`);

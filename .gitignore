@@ -21,3 +21,8 @@ test-results/
 .DS_Store
 *.zip
 screenshots/
+!docs/screenshots/
+docs/screenshots/*
+!docs/screenshots/dashboard.png
+!docs/screenshots/issues-modal.png
+!docs/screenshots/mobile.png

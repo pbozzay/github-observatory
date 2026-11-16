@@ -20,7 +20,17 @@ async function jsonBody(req){
  try{const value=JSON.parse(Buffer.concat(chunks).toString('utf8')||'{}');if(!value||Array.isArray(value)||typeof value!=='object')throw new Error();return value;}catch{throw problem(400,'Invalid JSON request.');}
 }
 
-export function createServer({service,publicDir,unlockKey,logger=()=>{},now=()=>Date.now()}){
+export function validateProxyConfiguration({publicOrigin,proxyKey}={}){
+ let external=null;
+ if(publicOrigin!==undefined||proxyKey!==undefined){
+  try{external=new URL(publicOrigin);}catch{throw new Error('A valid HTTPS public origin is required.');}
+  if(external.protocol!=='https:'||external.origin!==publicOrigin||external.username||external.password||typeof proxyKey!=='string'||!/^[A-Za-z0-9_-]{32,128}$/.test(proxyKey))throw new Error('HTTPS origin and a strong reverse-proxy key are required.');
+ }
+ return external;
+}
+
+export function createServer({service,publicDir,unlockKey,publicOrigin,proxyKey,logger=()=>{},now=()=>Date.now()}){
+ const external=validateProxyConfiguration({publicOrigin,proxyKey});
  if(typeof unlockKey!=='string'||!unlockKey)throw new Error('Local unlock key required.');
  const files=publicFiles(publicDir),sessions=new Map();let failures=[];let syncing=false;
  const server=http.createServer(async(req,res)=>{
@@ -29,8 +39,12 @@ export function createServer({service,publicDir,unlockKey,logger=()=>{},now=()=>
   try{
    const port=server.address()?.port;
    const validHosts=new Set([`127.0.0.1:${port}`,`localhost:${port}`]);
-   const host=String(req.headers.host||'');if(!validHosts.has(host))throw problem(403,'Request not permitted.');
-   const origin=`http://${host}`;
+   const host=String(req.headers.host||'');
+   const localHealth=external&&req.method==='GET'&&req.url==='/health'&&validHosts.has(host)&&['127.0.0.1','::1','::ffff:127.0.0.1'].includes(req.socket.remoteAddress)&&!req.headers.origin;
+   if(localHealth){send(200,{status:'running'});return;}
+   const trustedProxy=Boolean(external&&host===external.host&&typeof req.headers['x-observatory-proxy-key']==='string'&&safeEqual(req.headers['x-observatory-proxy-key'],proxyKey));
+   if(external?!trustedProxy:!validHosts.has(host))throw problem(403,'Request not permitted.');
+   const origin=external?external.origin:`http://${host}`;
    if(req.headers.origin&&req.headers.origin!==origin)throw problem(403,'Request not permitted.');
    const url=new URL(req.url,origin),route=url.pathname;
    if(req.method==='GET'&&route==='/health'){send(200,{status:'running'});return;}
@@ -44,12 +58,12 @@ export function createServer({service,publicDir,unlockKey,logger=()=>{},now=()=>
     if(authenticated&&!body.key){send(200,{ok:true,csrf:session.csrf});return;}
     failures=failures.filter(t=>now()-t<60000);
     if(failures.length>=12)throw problem(429,'Too many unlock attempts. Try again in a minute.');
-    if(typeof body.key!=='string'||!safeEqual(body.key,unlockKey)){failures.push(now());throw problem(401,'Unlock required.');}
+    if(!(trustedProxy&&!body.key)&&(typeof body.key!=='string'||!safeEqual(body.key,unlockKey))){failures.push(now());throw problem(401,'Unlock required.');}
     for(const [id,s] of sessions)if(s.expires<=now())sessions.delete(id);
     while(sessions.size>=10)sessions.delete(sessions.keys().next().value);
     const id=randomBytes(32).toString('base64url'),csrf=randomBytes(24).toString('base64url');
     sessions.set(id,{csrf,expires:now()+12*60*60*1000});
-    send(200,{ok:true,csrf},undefined,{'Set-Cookie':`observatory_session=${id}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200`});return;
+    send(200,{ok:true,csrf},undefined,{'Set-Cookie':`observatory_session=${id}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200${external?'; Secure':''}`});return;
    }
    if(route.startsWith('/api/')){
     if(!authenticated)throw problem(401,'Unlock required.');
@@ -60,6 +74,10 @@ export function createServer({service,publicDir,unlockKey,logger=()=>{},now=()=>
     if(req.method==='GET'&&route==='/api/status'){send(200,service.status());return;}
     if(req.method==='GET'&&route==='/api/events'){
      const limit=Number(url.searchParams.get('limit')||100);if(!Number.isInteger(limit)||limit<1||limit>500)throw problem(400,'Invalid event limit.');send(200,service.events(limit));return;
+    }
+    if(req.method==='GET'&&route==='/api/details'){
+     for(const key of ['repository','metric','range','offset','limit'])if(url.searchParams.getAll(key).length>1)throw problem(400,'Ambiguous detail parameter.');
+     send(200,service.details({repository:url.searchParams.get('repository'),metric:url.searchParams.get('metric'),range:url.searchParams.get('range')??'30',offset:url.searchParams.get('offset')??'0',limit:url.searchParams.get('limit')??'50'}));return;
     }
     if(req.method==='GET'&&route==='/api/discover'){send(200,await service.discover());return;}
     if(req.method==='POST'&&route==='/api/watches'){

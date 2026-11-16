@@ -1,5 +1,5 @@
 import { DatabaseSync, backup as sqliteBackup } from 'node:sqlite';
-import { mkdirSync, openSync, closeSync, readFileSync, unlinkSync, writeFileSync, realpathSync, chmodSync, existsSync } from 'node:fs';
+import { mkdirSync, openSync, closeSync, lstatSync, unlinkSync, realpathSync, chmodSync, existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 
 const DAY = 86_400_000;
@@ -64,11 +64,12 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
   };
   clock();
   let path = dbPath;
-  let lockPath = null;
-  let ownsLock = false;
+  let writerLock;
+  let ownsActive = false;
   let db;
   let closed = false;
   let closing = false;
+  let closePromise = null;
   let flight = null;
   let nextRun = null;
   const pending = new Set();
@@ -79,31 +80,29 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
       path = resolve(realpathSync(dirname(fullPath)), fullPath.slice(dirname(fullPath).length + 1));
       if (existsSync(path)) path = realpathSync(path);
       if (ACTIVE.has(path)) throw safe('Database already has an active writer.', 409, 'busy');
-      lockPath = `${path}.writer.lock`;
+      // A legacy PID cannot establish identity across PID namespaces/reuse.
+      // Fail closed even for a seemingly dead PID; offline migration must verify
+      // the old writer is stopped before removing its lock. Never mutate it here.
       try {
-        const fd = openSync(lockPath, 'wx', 0o600);
-        ownsLock = true;
-        try { writeFileSync(fd, String(process.pid)); } finally { closeSync(fd); }
+        lstatSync(`${path}.writer.lock`);
+        throw safe('Legacy database writer lock requires offline recovery.', 409, 'busy');
       } catch (error) {
-        if (error.code !== 'EEXIST') throw error;
-        // Serialize stale-lock recovery: a competing startup must not unlink a newly acquired lock.
-        const recoveryPath = `${lockPath}.recovery`;
-        let recovery;
-        try { recovery = openSync(recoveryPath, 'wx', 0o600); }
-        catch { throw safe('Database writer recovery is already active.', 409, 'busy'); }
-        try {
-          const pid = Number(readFileSync(lockPath, 'utf8'));
-          if (!Number.isSafeInteger(pid) || pid < 1) throw safe('Database writer lock requires recovery.', 409, 'busy');
-          let alive = true;
-          try { process.kill(pid, 0); } catch (probe) { if (probe.code === 'ESRCH') alive = false; }
-          if (alive) throw safe('Database already has an active writer.', 409, 'busy');
-          unlinkSync(lockPath);
-          const fd = openSync(lockPath, 'wx', 0o600);
-          ownsLock = true;
-          try { writeFileSync(fd, String(process.pid)); } finally { closeSync(fd); }
-        } finally { closeSync(recovery); unlinkSync(recoveryPath); }
+        if (error.code !== 'ENOENT') throw error;
+      }
+      // This dedicated rollback-journal connection holds a kernel-managed lock
+      // for the service lifetime, without locking the application WAL database.
+      // Never unlink the sidecar: different inodes would allow competing writers.
+      const lockPath = `${path}.writer.sqlite`;
+      writerLock = new DatabaseSync(lockPath);
+      chmodSync(lockPath, 0o600);
+      try {
+        writerLock.exec('PRAGMA busy_timeout=0; PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;');
+      } catch (error) {
+        if (error.errcode === 5 || error.errcode === 6) throw safe('Database already has an active writer.', 409, 'busy');
+        throw error;
       }
       ACTIVE.add(path);
+      ownsActive = true;
     }
     db = new DatabaseSync(path);
     if (path !== ':memory:') chmodSync(path, 0o600);
@@ -126,18 +125,31 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
         id TEXT PRIMARY KEY, repo_id TEXT NOT NULL REFERENCES repositories(id), type TEXT NOT NULL,
         day TEXT NOT NULL, title TEXT NOT NULL, url TEXT NOT NULL, author TEXT
       );
+      CREATE INDEX IF NOT EXISTS events_detail_scope ON events(repo_id,type,day DESC,id);
+      CREATE TABLE IF NOT EXISTS issue_snapshots (
+        repo_id TEXT PRIMARY KEY REFERENCES repositories(id), observed_at TEXT,
+        complete INTEGER NOT NULL CHECK(complete IN (0,1))
+      );
+      CREATE TABLE IF NOT EXISTS issue_records (
+        repo_id TEXT NOT NULL REFERENCES repositories(id), number INTEGER NOT NULL CHECK(number > 0),
+        day TEXT NOT NULL, title TEXT NOT NULL, url TEXT NOT NULL, PRIMARY KEY(repo_id,number)
+      );
+      CREATE INDEX IF NOT EXISTS issue_detail_scope ON issue_records(repo_id,day DESC,number);
       CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS budgets (identity TEXT PRIMARY KEY, remaining INTEGER NOT NULL, reset_at INTEGER NOT NULL, blocked_until INTEGER NOT NULL DEFAULT 0);
       PRAGMA user_version=1;`);
+    // Include recovery in initialization cleanup: a failed UPDATE must not leak
+    // either database handle or the lifetime writer lock.
+    db.prepare("UPDATE runs SET status='interrupted', message='Collection interrupted; previous observations retained.' WHERE status='collecting'").run();
   } catch (error) {
     try { db?.close(); } catch {}
-    if (ownsLock) { ACTIVE.delete(path); try { unlinkSync(lockPath); } catch {} }
+    try { writerLock?.close(); } catch {}
+    if (ownsActive) ACTIVE.delete(path);
     throw error.safeMessage ? error : safe('Unable to open local database.', 500, 'storage');
   }
   const getState = key => db.prepare('SELECT value FROM state WHERE key=?').get(key)?.value ?? null;
   const setState = (key, value) => db.prepare('INSERT INTO state(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, value);
-  // A process interruption is visible; prior committed endpoint results remain intact.
-  db.prepare("UPDATE runs SET status='interrupted', message='Collection interrupted; previous observations retained.' WHERE status='collecting'").run();
+
   const ensureOpen = () => { if (closed || closing) throw safe('Service is closed.', 503, 'closed'); };
   const transaction = action => {
     db.exec('BEGIN IMMEDIATE');
@@ -259,14 +271,18 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
     }
     run(repo.id, 'metadata', 'ok', at, 'Repository metadata collected.');
   }
-  function dashboard(range = '30') {
-    ensureOpen();
+  function dateWindow(range) {
     const selection = String(range);
     if (!['7', '30', '90', 'all'].includes(selection)) throw safe('Invalid range.');
     const end = isoDay(clock());
     const lower = isoDay(Date.parse(`${end}T00:00:00Z`) - 3659 * DAY);
     const first = db.prepare('SELECT MIN(day) AS day FROM points WHERE day<=?').get(end).day;
     const start = selection === 'all' ? (first && first > lower ? first : first ? lower : end) : isoDay(Date.parse(`${end}T00:00:00Z`) - (Number(selection) - 1) * DAY);
+    return { start, end };
+  }
+  function dashboard(range = '30') {
+    ensureOpen();
+    const { start, end } = dateWindow(range);
     const dates = datesBetween(start, end);
     const repos = db.prepare('SELECT * FROM repositories WHERE paused=0 ORDER BY lower(owner),lower(name)').all().map(row => {
       const metrics = {};
@@ -297,6 +313,39 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
     ensureOpen();
     if (!Number.isInteger(Number(limit)) || Number(limit) < 1) throw safe('Invalid event limit.');
     return { events: db.prepare(`SELECT events.*,repositories.owner,repositories.name FROM events JOIN repositories ON repositories.id=events.repo_id ORDER BY day DESC,id LIMIT ?`).all(Math.min(Number(limit), 500)).map(row => ({ id: row.id, repository: `${row.owner}/${row.name}`, type: row.type, date: row.day, title: row.title, url: row.url, ...(row.author ? { author: row.author } : {}) })) };
+  }
+  function details({ repository, metric, range = '30', offset = 0, limit = 50 } = {}) {
+    ensureOpen();
+    if (typeof repository !== 'string' || !/^[1-9]\d*$/.test(repository)) throw safe('Invalid repository ID.');
+    if (typeof metric !== 'string' || !Object.hasOwn(DEFINITIONS, metric)) throw safe('Invalid metric.');
+    if (!['string', 'number'].includes(typeof range)) throw safe('Invalid range.');
+    const { start, end } = dateWindow(range);
+    const integer = (value, minimum, maximum) => {
+      if (!['number', 'string'].includes(typeof value) || !/^(0|[1-9]\d*)$/.test(String(value)) || !Number.isSafeInteger(Number(value)) || Number(value) < minimum || Number(value) > maximum) throw safe('Invalid detail pagination.');
+      return Number(value);
+    };
+    offset = integer(offset, 0, Number.MAX_SAFE_INTEGER);
+    limit = integer(limit, 1, 100);
+    if (!db.prepare('SELECT 1 FROM repositories WHERE id=? AND paused=0').get(repository)) throw safe('Watch not found.', 404);
+    const outcome = db.prepare('SELECT * FROM runs WHERE repo_id=? AND metric=?').get(repository, metric);
+    const latest = db.prepare('SELECT observed_at FROM points WHERE repo_id=? AND metric=? AND day<=? ORDER BY day DESC LIMIT 1').get(repository, metric, end);
+    const covered = db.prepare('SELECT COUNT(*) AS count FROM points WHERE repo_id=? AND metric=? AND day>=? AND day<=?').get(repository, metric, start, end).count;
+    const result = { items: [], total: 0, hasMore: false, offset, limit, kind: 'observations', observedAt: latest?.observed_at ?? null, status: outcome?.status ?? 'not_collected', complete: outcome?.status === 'ok' && covered === datesBetween(start, end).length };
+    if (['commits', 'merged_prs', 'releases'].includes(metric)) {
+      result.kind = 'events';
+      result.total = db.prepare('SELECT COUNT(*) AS count FROM events WHERE repo_id=? AND type=? AND day>=? AND day<=?').get(repository, metric, start, end).count;
+      result.items = db.prepare('SELECT id,day AS date,title,url,author FROM events WHERE repo_id=? AND type=? AND day>=? AND day<=? ORDER BY day DESC,id LIMIT ? OFFSET ?').all(repository, metric, start, end, limit, offset).map(({ author, ...item }) => ({ ...item, ...(author ? { author } : {}) }));
+    } else if (metric === 'issues') {
+      const snapshot = db.prepare('SELECT * FROM issue_snapshots WHERE repo_id=?').get(repository);
+      result.kind = 'snapshot';
+      result.observedAt = snapshot?.observed_at ?? null;
+      result.complete = snapshot?.complete === 1 && outcome?.status === 'ok';
+      if (outcome?.status === 'ok' && !result.complete) result.status = 'details_incomplete';
+      result.total = db.prepare('SELECT COUNT(*) AS count FROM issue_records WHERE repo_id=?').get(repository).count;
+      result.items = db.prepare('SELECT number,day AS date,title,url FROM issue_records WHERE repo_id=? ORDER BY day DESC,number LIMIT ? OFFSET ?').all(repository, limit, offset).map(({ number, ...item }) => ({ id: `${repository}:issues:${number}`, ...item }));
+    }
+    result.hasMore = offset < result.total - result.items.length;
+    return result;
   }
   const addWatch = ({ repository, access } = {}) => tracked(async () => {
     const name = repositoryName(repository);
@@ -390,9 +439,31 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
     });
     await perform('issues', async () => {
       const items = incomplete(await pages(`${route}/issues`, { state: 'open', sort: 'created', direction: 'asc' }, row.access, context));
-      const ids = new Set();
-      for (const item of items) { if (!nonnegative(item.id) || item.id < 1) throw safe('Invalid issue response.', 502, 'invalid_response'); if (!item.pull_request) ids.add(item.id); }
-      transaction(() => { putPoint(row.id, 'issues', end, ids.size, at); run(row.id, 'issues', 'ok', at, 'Observed open issues, excluding pull requests.'); setState('updatedAt', at); });
+      const issues = new Map();
+      for (const item of items) {
+        if (!item || !nonnegative(item.id) || item.id < 1) throw safe('Invalid issue response.', 502, 'invalid_response');
+        if (!item.pull_request) issues.set(item.id, item);
+      }
+      const records = new Map();
+      for (const item of issues.values()) {
+        const day = dateOf(item.created_at);
+        if (!day || !nonnegative(item.number) || item.number < 1) continue;
+        records.set(item.number, { day, title: text(item.title) || `Issue #${item.number}`, url: `${web}/issues/${item.number}` });
+      }
+      const detailsComplete = records.size === issues.size;
+      transaction(() => {
+        // Count-only responses remain usable, but never replace a good detail snapshot.
+        if (detailsComplete) {
+          db.prepare('DELETE FROM issue_records WHERE repo_id=?').run(row.id);
+          for (const [number, value] of records) db.prepare('INSERT INTO issue_records(repo_id,number,day,title,url) VALUES(?,?,?,?,?)').run(row.id, number, value.day, value.title, value.url);
+          db.prepare('INSERT INTO issue_snapshots(repo_id,observed_at,complete) VALUES(?,?,1) ON CONFLICT(repo_id) DO UPDATE SET observed_at=excluded.observed_at,complete=1').run(row.id, at);
+        } else {
+          db.prepare('INSERT INTO issue_snapshots(repo_id,observed_at,complete) VALUES(?,NULL,0) ON CONFLICT(repo_id) DO UPDATE SET complete=0').run(row.id);
+        }
+        putPoint(row.id, 'issues', end, issues.size, at);
+        run(row.id, 'issues', 'ok', at, detailsComplete ? 'Observed open issues, excluding pull requests.' : 'Observed open issue count; details incomplete, previous records retained.');
+        setState('updatedAt', at);
+      });
     });
     for (const metric of ['views', 'clones', 'star_activity']) await perform(metric, async () => {
       const endpoint = metric === 'star_activity' ? `${route}/stargazers/history` : `${route}/traffic/${metric}`;
@@ -491,16 +562,23 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
   });
   async function close() {
     if (closed) return;
-    if (closing) { await Promise.allSettled([...pending]); return; }
+    if (closePromise) return closePromise;
     closing = true;
-    await Promise.allSettled([...pending]);
-    db.close(); closed = true;
-    if (lockPath) { ACTIVE.delete(path); try { unlinkSync(lockPath); } catch {} }
+    closePromise = (async () => {
+      await Promise.allSettled([...pending]);
+      // Release exclusivity only after every operation and the data connection
+      // have closed. If close fails, retain ownership and allow a close retry.
+      db?.close(); db = null;
+      writerLock?.close(); writerLock = null;
+      if (ownsActive) { ACTIVE.delete(path); ownsActive = false; }
+      closed = true;
+    })();
+    try { await closePromise; } finally { closePromise = null; }
   }
   function setNextRun(iso) {
     ensureOpen();
     if (iso !== null && (typeof iso !== 'string' || !Number.isFinite(Date.parse(iso)))) throw safe('Invalid schedule.');
     nextRun = iso === null ? null : new Date(iso).toISOString();
   }
-  return { dashboard, status, events, discover, addWatch, sync, pauseWatch, backup, close, setNextRun };
+  return { dashboard, status, events, details, discover, addWatch, sync, pauseWatch, backup, close, setNextRun };
 }

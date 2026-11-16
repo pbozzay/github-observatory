@@ -4,8 +4,47 @@ export const escapeHTML = value => String(value ?? '').replace(/[&<>"']/g, c => 
 export const fmt = value => finite(value) ? new Intl.NumberFormat().format(value) : '';
 export const observed = metric => metric && (finite(metric.value) || metric.points?.some(p => finite(p.value)));
 export const keys = repo => Object.keys(repo.metrics || {}).filter(k => observed(repo.metrics[k]));
+export const collectionProblem=status=>/^(error|failed|failure|rate_limited|rate-limited|forbidden|unauthorized|unavailable|upstream_error|invalid_response|network_error|timeout|partial|budget_exhausted|unsupported)$/.test(status||'');
+function combinedStatus(values){const states=values.filter(Boolean);return states.find(collectionProblem)||states.find(s=>s==='collecting')||states[0]||null;}
+export const CARD_METRICS=Object.freeze({commits:'Commits',stars:'Stars',views:'Views',issues:'Open issues',forks:'Forks',merged_prs:'Merged PRs',releases:'Releases',clones:'Clones'});
+export const DEFAULT_CHART_KEYS=Object.freeze(['commits','stars','views','issues']);
+export function validateChartKeys(value){
+  return Array.isArray(value)&&value.length===4&&value.every(key=>typeof key==='string'&&Object.hasOwn(CARD_METRICS,key))&&new Set(value).size===4?[...value]:null;
+}
+export function validateThresholds(value) {
+  return value && Number.isSafeInteger(value.warning) && Number.isSafeInteger(value.danger) && value.warning>=0 && value.danger>value.warning ? {warning:value.warning,danger:value.danger} : null;
+}
+export function issueLevel(value, thresholds) {
+  if(!finite(value))return '';
+  return value>thresholds.danger?'danger':value>thresholds.warning?'warning':'';
+}
+// One presentation metric, two explicitly different measurements. Raw storage
+// still keeps outstanding-star balances and star-creation activity separate.
+export function presentRepository(repo) {
+  const {star_activity:activity,...metrics}=repo.metrics || {};
+  if(observed(metrics.stars) && activity?.points?.some(p=>finite(p.value))){
+    metrics.stars={...metrics.stars,points:activity.points,chartKind:'event',chartLabel:'Daily stars gained',chartCoverage:activity.coverage,chartSource:activity.source,chartLastSuccess:activity.lastSuccess,chartStatus:activity.status};
+  }
+  return {...repo,metrics};
+}
 export function githubURL(value) {
   try { const u = new URL(value); return u.protocol === 'https:' && u.hostname === 'github.com' && !u.port && !u.username && !u.password ? u.href : null; } catch { return null; }
+}
+// Navigation only: these destinations never imply locally collected records.
+export function githubMetricAction(repo,key,dates=[]) {
+  const safe=githubURL(repo.url);if(!safe)return null;
+  const base=new URL(safe);
+  if(base.search||base.hash||!/^\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/?$/.test(base.pathname))return null;
+  const paths={commits:'commits',issues:'issues',merged_prs:'pulls',releases:'releases',stars:'stargazers',forks:'forks',views:'graphs/traffic',clones:'graphs/traffic'};
+  const labels={commits:'Browse commits',issues:'Triage open issues',merged_prs:'Review merged PRs',releases:'Browse releases',stars:'View stargazers',forks:'Explore forks',views:'View traffic on GitHub',clones:'View traffic on GitHub'};
+  if(!Object.hasOwn(paths,key))return null;
+  const url=new URL(base.href.replace(/\/$/,'')+'/'+paths[key]);
+  const valid=dates.length>0&&dates.every(d=>typeof d==='string'&&/^\d{4}-\d{2}-\d{2}$/.test(d)&&!Number.isNaN(Date.parse(d))&&new Date(d).toISOString().slice(0,10)===d);
+  const start=valid?dates[0]:null,end=valid?dates.at(-1):null,range=start&&start<=end;
+  if(key==='issues')url.searchParams.set('q','is:issue is:open');
+  if(key==='merged_prs')url.searchParams.set('q','is:pr is:merged'+(range?' merged:'+start+'..'+end:''));
+  if(key==='commits'&&range){url.searchParams.set('since',start+'T00:00:00Z');url.searchParams.set('until',end+'T23:59:59Z');}
+  return {url:url.href,label:labels[key]};
 }
 export function aligned(metric, dates) {
   const points = new Map((metric.points || []).map(p => [p.date, p.value]));
@@ -15,27 +54,41 @@ export function aligned(metric, dates) {
 // Event totals require identical observed-day masks; balance totals require the
 // same latest observation date. Detail exposes the selected cohort and coverage.
 export function aggregate(repos, key, dates) {
-  const groups = new Map();
-  for (const repo of repos) {
-    const m = repo.metrics?.[key];
-    if (!observed(m) || !finite(m.value)) continue;
-    const points = aligned(m, dates);
-    const known = points.filter(p => finite(p.value));
-    if (!known.length) continue;
-    const mask = m.kind === 'event' ? known.map(p => p.date).join(',') : known.at(-1).date;
-    const signature = JSON.stringify([m.kind, m.unit, mask, m.coverage?.start, m.coverage?.end]);
-    if (!groups.has(signature)) groups.set(signature, []);
-    groups.get(signature).push({repo, metric:m, points});
+  const groups=new Map(),counted=[];
+  for(const repo of repos){
+    const m=repo.metrics?.[key];if(!observed(m)||!finite(m.value))continue;
+    counted.push({repo,metric:m});
+    const points=aligned(m,dates),known=points.filter(p=>finite(p.value));
+    if(!known.length)continue;
+    const chartKind=m.chartKind||m.kind,coverage=m.chartCoverage||m.coverage;
+    const mask=chartKind==='event'?known.map(p=>p.date).join(','):known.at(-1).date;
+    const signature=JSON.stringify([chartKind,m.unit,mask,coverage?.start,coverage?.end]);
+    if(!groups.has(signature))groups.set(signature,[]);
+    groups.get(signature).push({repo,metric:m,points});
   }
-  const cohort = [...groups.values()].sort((a,b) => b.length-a.length || b[0].points.filter(p=>finite(p.value)).length-a[0].points.filter(p=>finite(p.value)).length)[0];
-  if (!cohort) return null;
-  const first = cohort[0].metric;
-  const points = dates.map((date,i) => ({date, value:cohort.every(x => finite(x.points[i].value)) ? cohort.reduce((sum,x)=>sum+x.points[i].value,0) : null}));
-  return {...first, value:cohort.reduce((s,x)=>s+x.metric.value,0), delta:cohort.every(x=>finite(x.metric.delta) && x.metric.coverage?.complete) ? cohort.reduce((s,x)=>s+x.metric.delta,0) : null,
-    points, coverage:{start:points.find(p=>finite(p.value))?.date ?? null,end:points.findLast(p=>finite(p.value))?.date ?? null,complete:cohort.every(x=>x.metric.coverage?.complete)}, contributors:cohort.map(x=>x.repo), lastSuccess:cohort.map(x=>x.metric.lastSuccess).filter(Boolean).sort()[0] ?? null};
+  let candidates=[...groups.values()];
+  if(key==='stars'&&candidates.some(c=>c[0].metric.chartKind==='event'))candidates=candidates.filter(c=>c[0].metric.chartKind==='event');
+  const cohort=candidates.sort((a,b)=>b.length-a.length||b[0].points.filter(p=>finite(p.value)).length-a[0].points.filter(p=>finite(p.value)).length)[0]||[];
+  if(!cohort.length && !(key==='stars'&&counted.length))return null;
+  const totals=key==='stars'?counted:cohort,first=(cohort[0]||totals[0]).metric;
+  const points=dates.map((date,i)=>({date,value:cohort.length&&cohort.every(x=>finite(x.points[i].value))?cohort.reduce((sum,x)=>sum+x.points[i].value,0):null}));
+  const coverage={start:points.find(p=>finite(p.value))?.date??null,end:points.findLast(p=>finite(p.value))?.date??null,complete:cohort.length>0&&points.length>0&&points.every(p=>finite(p.value))&&cohort.every(x=>(x.metric.chartCoverage||x.metric.coverage)?.complete===true)};
+  return {...first,status:combinedStatus(totals.map(x=>x.metric.status)),
+    ...(first.chartKind?{chartCoverage:coverage,chartStatus:combinedStatus(cohort.map(x=>x.metric.chartStatus)),chartLastSuccess:cohort.map(x=>x.metric.chartLastSuccess).filter(Boolean).sort()[0]??null,chartSource:[...new Set(cohort.map(x=>x.metric.chartSource).filter(Boolean))].join('; ')}:{}),
+    value:totals.reduce((s,x)=>s+x.metric.value,0),delta:totals.every(x=>finite(x.metric.delta)&&x.metric.coverage?.complete)?totals.reduce((s,x)=>s+x.metric.delta,0):null,
+    points,coverage,
+    contributors:totals.map(x=>x.repo),chartContributors:cohort.map(x=>x.repo),lastSuccess:totals.map(x=>x.metric.lastSuccess).filter(Boolean).sort()[0]??null};
 }
-export function chart(points, {small=false}={}) {
-  const w=small?180:390, h=small?38:180, left=small?4:42, right=w-8, top=small?4:12, bottom=h-(small?4:26);
+export function chartView(metric,dates,mode='cumulative') {
+  const points=aligned(metric,dates),event=(metric.chartKind||metric.kind)==='event',cumulative=event&&mode==='cumulative';
+  let total=0;
+  return {points:cumulative?points.map(p=>({...p,value:finite(p.value)?(total+=p.value):null})):points,
+    kind:cumulative?'balance':metric.chartKind||metric.kind,
+    label:event?(metric.chartLabel?metric.chartLabel.replace(/^Daily /,cumulative?'Cumulative ':'Daily '):cumulative?'Cumulative in range':'Daily observations'):'Observed balance',
+    cumulative};
+}
+export function chart(points, {small=false,kind='balance',compact=false,width=390}={}) {
+  const w=small?180:width, h=small?38:compact?100:180, left=small?4:42, right=w-8, top=small?4:12, bottom=h-(small?4:compact?20:26);
   const known=points.filter(p=>finite(p.value));
   if (!known.length) return '';
   const max=Math.max(1,...known.map(p=>p.value)), min=Math.min(0,...known.map(p=>p.value));
@@ -43,10 +96,22 @@ export function chart(points, {small=false}={}) {
   const segments=[]; let current=[];
   for(const p of coords){if(p)current.push(p);else if(current.length){segments.push(current);current=[];}}
   if(current.length)segments.push(current);
-  const paths=segments.map(segment=>segment.length===1?`<circle class="chart-dot" cx="${segment[0].x}" cy="${segment[0].y}" r="3"><title>${escapeHTML(segment[0].date)}: ${fmt(segment[0].value)}</title></circle>`:`<path class="chart-line" d="${segment.map((p,i)=>`${i?'L':'M'}${p.x},${p.y}`).join(' ')}"/>`).join('');
+  const zero=bottom-(0-min)/(max-min)*(bottom-top),half=points.length>1?(right-left)/(points.length-1)/2:(right-left)/2;
+  const paths=segments.map(segment=>{
+    if(kind==='event'){
+      const start=Math.max(left,segment[0].x-half),end=Math.min(right,segment.at(-1).x+half);
+      let d=`M${start},${segment[0].y}`;
+      segment.forEach((p,i)=>{if(i)d+=` H${(segment[i-1].x+p.x)/2} V${p.y}`;});d+=` H${end}`;
+      return `<path class="chart-area" d="${d} L${end},${zero} L${start},${zero} Z"/><path class="chart-line" d="${d}"/>`;
+    }
+    if(segment.length===1)return `<circle class="chart-dot" cx="${segment[0].x}" cy="${segment[0].y}" r="2"><title>${escapeHTML(segment[0].date)}: ${fmt(segment[0].value)}</title></circle>`;
+    const d=segment.map((p,i)=>`${i?'L':'M'}${p.x},${p.y}`).join(' ');
+    return `<path class="chart-area" d="${d} L${segment.at(-1).x},${zero} L${segment[0].x},${zero} Z"/><path class="chart-line" d="${d}"/>`;
+  }).join('');
+  const baseline=`<line class="chart-baseline" x1="${left}" y1="${zero}" x2="${right}" y2="${zero}"/>`;
   const hits=small?'':coords.filter(Boolean).map(p=>`<circle class="chart-hit" cx="${p.x}" cy="${p.y}" r="5"><title>${escapeHTML(p.date)}: ${fmt(p.value)}</title></circle>`).join('');
   const axes=small?'':`<line class="chart-grid" x1="${left}" y1="${bottom}" x2="${right}" y2="${bottom}"/><text class="chart-axis" x="0" y="16">${fmt(max)}</text><text class="chart-axis" x="0" y="${bottom}">${fmt(min)}</text><text class="chart-axis" x="${left}" y="${h-4}">${escapeHTML(points[0]?.date)}</text><text class="chart-axis" text-anchor="end" x="${right}" y="${h-4}">${escapeHTML(points.at(-1)?.date)}</text>`;
-  return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" aria-hidden="true">${axes}${paths}${hits}</svg>`;
+  return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" aria-hidden="true">${axes}${baseline}${paths}${hits}</svg>`;
 }
 export function csvCell(value) {
   let text=String(value ?? '');
