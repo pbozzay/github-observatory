@@ -59,8 +59,8 @@ test('frontend contract and responsive interactions',async t=>{
       throw Error('Unexpected API route '+url.pathname);
     }
     const name=url.pathname==='/'?'index.html':url.pathname.slice(1);
-    assert.ok(['index.html','app.js','style.css','metrics.js','icon.svg'].includes(name));
-    return route.fulfill({contentType:name.endsWith('.svg')?'image/svg+xml':name.endsWith('.css')?'text/css':name.endsWith('.js')?'text/javascript':'text/html',body:await readFile(new URL('../public/'+name,import.meta.url))});
+    assert.ok(['index.html','app.js','style.css','metrics.js','icon.svg','favicon.ico','icon-32.png','icon-180.png'].includes(name));
+    return route.fulfill({contentType:name.endsWith('.ico')?'image/x-icon':name.endsWith('.png')?'image/png':name.endsWith('.svg')?'image/svg+xml':name.endsWith('.css')?'text/css':name.endsWith('.js')?'text/javascript':'text/html',body:await readFile(new URL('../public/'+name,import.meta.url))});
   });
   await t.test('locked shell, manual unlock and no secret persistence',async()=>{
     await page.goto('http://observatory.test/?search=private-name');
@@ -82,7 +82,7 @@ test('frontend contract and responsive interactions',async t=>{
     assert.equal(await page.locator('[data-project="one"] [data-metric="stars"] .chart-area').count(),1);
     assert.equal(await page.locator('[data-metric="star_activity"]').count(),0);assert.equal(await page.locator('option[value="star_activity"]').count(),0);
     assert.equal(await page.locator('option').filter({hasText:'Unknown'}).count(),0);
-    assert.equal(await page.locator('[data-project="two"] .badge.private').count(),1);assert.equal(await page.locator('[data-project="two"] .badge.archived').count(),1);
+    assert.equal(await page.locator('[data-project="two"] .visibility-icon').getAttribute('aria-label'),'Private repository');assert.equal(await page.locator('[data-project="one"] .visibility-icon').getAttribute('title'),'Public repository');assert.equal(await page.locator('[data-project="one"] .eye-slash').count(),0);assert.equal(await page.locator('[data-project="two"] .eye-slash').count(),1);assert.equal(await page.locator('[data-project="two"] .badge.archived').count(),1);
     await page.click('[data-aggregate-detail="commits"]');assert.match(await page.locator('#dialog-body').textContent(),/2 of 3 filtered projects/);await page.keyboard.press('Escape');assert.equal(await page.locator('#dialog').isVisible(),false);
   });
   await t.test('Settings chooses all four cards and persists without losing choices under filters',async()=>{
@@ -192,9 +192,9 @@ test('frontend contract and responsive interactions',async t=>{
     await page.fill('#repository','https://github.com/test-owner/public-repository');await page.click('#watch-form button');await page.waitForFunction(()=>document.querySelector('#dialog-message').textContent==='Public watch added.');
     assert.ok(calls.some(c=>c.path==='/api/watches'&&c.body.access==='public'));
     await page.keyboard.press('Escape');assert.equal(await page.evaluate(()=>document.activeElement.id),'settings');
-    await page.click('[data-project="one"] [data-unwatch]');await page.click('#cancel-unwatch');assert.equal(await page.locator('[data-project="one"]').count(),1);
-    failPause=true;await page.click('[data-project="one"] [data-unwatch]');await page.click('#confirm-pause');await page.waitForFunction(()=>document.querySelector('#dialog-message').textContent.includes('could not be completed'));assert.equal(await page.locator('[data-project="one"]').count(),1);await page.click('#cancel-unwatch');failPause=false;
-    await page.click('[data-project="one"] [data-unwatch]');assert.match(await page.locator('#dialog-body').textContent(),/stop collection.*active view.*history/i);await page.click('#confirm-pause');await page.waitForSelector('#dialog',{state:'hidden'});assert.ok(calls.some(c=>c.path==='/api/watches/one/pause'));
+    await page.click('#settings');await page.click('[data-watched="one"] [data-unwatch]');await page.click('#cancel-unwatch');assert.equal(await page.locator('[data-project="one"]').count(),1);
+    failPause=true;await page.click('#settings');await page.click('[data-watched="one"] [data-unwatch]');await page.click('#confirm-pause');await page.waitForFunction(()=>document.querySelector('#dialog-message').textContent.includes('could not be completed'));assert.equal(await page.locator('[data-project="one"]').count(),1);await page.click('#cancel-unwatch');failPause=false;
+    await page.click('#settings');await page.click('[data-watched="one"] [data-unwatch]');assert.match(await page.locator('#dialog-body').textContent(),/stop collection.*active view.*history/i);await page.click('#confirm-pause');await page.waitForSelector('#dialog',{state:'hidden'});assert.ok(calls.some(c=>c.path==='/api/watches/one/pause'));
     assert.equal(await page.locator('[data-project="one"]').count(),0);assert.match(await page.locator('#toast').textContent(),/Unwatched.*history is retained/);
     await page.click('#settings');assert.equal(await page.locator('[data-watched="one"]').count(),0);assert.equal(await page.locator('[data-watched="two"] [data-unwatch]').count(),1);await page.keyboard.press('Escape');
     const history=JSON.stringify(retained.get('test-owner/alpha').metrics);
@@ -219,7 +219,8 @@ test('frontend contract and responsive interactions',async t=>{
       }
     }
     await page.setViewportSize({width:1440,height:1000});
-    const geom=await page.locator('[data-project="one"]').evaluate(row=>{const name=row.querySelector('.project-name').getBoundingClientRect(),metrics=row.querySelector('.metric-grid').getBoundingClientRect(),badges=row.querySelector('.badges').getBoundingClientRect();return {horizontal:metrics.x>name.x,badgesBelow:badges.top>=name.bottom&&badges.x<metrics.x};});assert.deepEqual(geom,{horizontal:true,badgesBelow:true});
+    const geom=await page.locator('[data-project="one"]').evaluate(row=>{const name=row.querySelector('.project-name').getBoundingClientRect(),metrics=row.querySelector('.metric-grid').getBoundingClientRect(),status=row.querySelector('.visibility-icon').getBoundingClientRect();return {horizontal:metrics.x>name.x,statusBeside:status.x>=name.right&&status.x-name.right<=9&&status.top<name.bottom};});assert.deepEqual(geom,{horizontal:true,statusBeside:true});
+    const archived=await page.locator('[data-project="two"]').evaluate(row=>{const name=row.querySelector('.project-name').getBoundingClientRect(),badge=row.querySelector('.badge.archived').getBoundingClientRect();return badge.top>=name.bottom;});assert.equal(archived,true);
     const aligned=await page.evaluate(()=>{
       const a=document.querySelector('[data-project="one"]'),b=document.querySelector('[data-project="two"]');
       const cells=[...a.querySelectorAll('.spark-metric')].map(e=>e.getBoundingClientRect());
@@ -421,7 +422,7 @@ test('dialog mutations belong only to their originating dialog session',async t=
         return true;
       }});
       await page.goto(DEMO_ORIGIN);await page.waitForSelector('.project-card');
-      if(operation==='unwatch'){await page.click('[data-project="atlas"] [data-unwatch]');await page.click('#confirm-pause');}
+      if(operation==='unwatch'){await page.click('#settings');await page.click('[data-watched="atlas"] [data-unwatch]');await page.click('#confirm-pause');}
       else{
         await page.click('#settings');
         if(operation==='public-watch'){await page.fill('#repository','demo-owner/new-watch');await page.click('#watch-form button');}
@@ -477,7 +478,7 @@ test('actionable drill-downs, accessibility, pagination and request isolation',a
   const close=async()=>{await page.keyboard.press('Escape');await page.waitForSelector('#dialog',{state:'hidden'});};
   const open=async key=>{await page.click(`[data-project="atlas"] [data-metric="${key}"]`);await loaded();};
   await page.goto(DEMO_ORIGIN);await page.waitForSelector('.project-card');
-  assert.equal(await page.locator('link[rel=icon]').getAttribute('href'),'/icon.svg');
+  assert.equal(await page.locator('link[rel=icon][type="image/svg+xml"]').getAttribute('href'),'/icon.svg?v=0.3.1');
   const icon=await page.evaluate(async()=>{const response=await fetch('/icon.svg');return {type:response.headers.get('content-type'),svg:await response.text()};});
   assert.match(icon.type,/image\/svg\+xml/);assert.match(icon.svg,/viewBox="0 0 64 64"/);assert.doesNotMatch(icon.svg,/<script|<image|href=|url\(/);
   await t.test('every top count, graph and project count opens contributions; selects stay independent',async()=>{

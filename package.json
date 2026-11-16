@@ -1,8 +1,8 @@
 {
   "name": "github-observatory",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
-  "description": "A self-hosted GitHub repository observatory with persistent history and compact, elegant project graphs.",
+  "description": "See what is happening across your GitHub projects: commits, stars, issues, and traffic in one self-hosted dashboard.",
   "type": "module",
   "engines": {
     "node": ">=24"

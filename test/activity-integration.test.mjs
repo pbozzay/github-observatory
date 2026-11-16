@@ -33,7 +33,7 @@ test('real collector → SQLite → HTTP → browser preserves rich activity and
   await page.click('[data-page="overview"]');await page.click('#repository-settings');assert.equal(await page.evaluate(()=>document.activeElement.id),'repository-graphs');
   const closeBox=await page.locator('#close').boundingBox(),dialogBox=await page.locator('#dialog').boundingBox();assert.ok(closeBox.y>=dialogBox.y&&closeBox.y+closeBox.height<=dialogBox.y+dialogBox.height,'Settings Close must remain onscreen after section jump');
   await page.keyboard.press('Escape');
-  await page.click('[data-project="101"] [data-unwatch="101"]');await page.click('#confirm-pause');await page.waitForFunction(()=>!document.querySelector('[data-project="101"]'));assert.equal(service.activity().total,0);
+  await page.click('#settings');await page.click('[data-watched="101"] [data-unwatch="101"]');await page.click('#confirm-pause');await page.waitForFunction(()=>!document.querySelector('[data-project="101"]'));assert.equal(service.activity().total,0);
   await page.click('#add');await page.fill('#repository','example/sample');await page.click('#watch-form button');await page.locator('[data-project="101"]').waitFor();assert.equal(service.activity().total,61);await page.keyboard.press('Escape');
   await page.click('[data-page="collection"]');assert.equal(await page.locator('#page-title').textContent(),'Logs');assert.deepEqual(errors,[]);
   await context.close();

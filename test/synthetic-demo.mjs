@@ -61,11 +61,11 @@ export async function installSyntheticDemo(context,{dashboard=syntheticDashboard
       return send({error:'Not available in synthetic demo'},404);
     }
     const name=url.pathname==='/'?'index.html':url.pathname.slice(1);
-    if(!['index.html','app.js','style.css','metrics.js','icon.svg'].includes(name)){blocked.push(url.href);return route.abort();}
-    let body=await readFile(new URL('../public/'+name,import.meta.url),'utf8');
+    if(!['index.html','app.js','style.css','metrics.js','icon.svg','favicon.ico','icon-32.png','icon-180.png'].includes(name)){blocked.push(url.href);return route.abort();}
+    let body=await readFile(new URL('../public/'+name,import.meta.url),/\.(png|ico)$/.test(name)?undefined:'utf8');
     if(name==='index.html')body=body.replace('<div class="shell">',banner+'<div class="shell">');
     if(name==='style.css')body+=demoCSS;
-    return route.fulfill({contentType:name.endsWith('.svg')?'image/svg+xml':name.endsWith('.css')?'text/css':name.endsWith('.js')?'text/javascript':'text/html',body});
+    return route.fulfill({contentType:name.endsWith('.ico')?'image/x-icon':name.endsWith('.png')?'image/png':name.endsWith('.svg')?'image/svg+xml':name.endsWith('.css')?'text/css':name.endsWith('.js')?'text/javascript':'text/html',body});
   });
   await context.routeWebSocket('**/*',socket=>socket.close());
   return {calls,blocked,dashboard};

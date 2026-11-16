@@ -1,6 +1,10 @@
 # Github Observatory
 
-A self-hosted GitHub analytics dashboard: four configurable overview cards above elegant repository rows, with compact history graphs and actionable drill-down tables. Public watches and explicitly selected private repositories share one view. SQLite retains observations beyond GitHub's short traffic window.
+A self-hosted dashboard for the GitHub projects you care about.
+
+See which projects are active, follow commits and releases, and find issues that need attention. Track stars, forks, and traffic over time, then click through to the people and changes behind the numbers.
+
+Public repositories and the private ones you choose live in one place. You pick what to watch and which graphs to show; Observatory keeps the collected history on your server, even after it disappears from GitHub's short traffic window.
 
 Your data stays on your server. There is no telemetry, hosted analytics account, or demo-data fallback in the application. Publishing this source does **not** publish your dashboard or database.
 
@@ -65,8 +69,9 @@ Use the same data directory when starting and opening a local instance. For Dock
 - Metrics without individual records show actual observations plus appropriate GitHub destinations: stargazers, forks, traffic, and repository activity. Counts are never turned into invented records.
 - Tables preserve raw daily values even in Cumulative mode. Unknown is not zero. Pagination, incomplete coverage, and stale observations are explicitly identified.
 - Repository names still open a full history view. Modals support keyboard access, Escape, focus restoration, and mobile scrolling.
-- Repository rows default to **recent activity**, with a remembered name/activity choice in Settings. The small cog above the rows opens **Repository graphs** directly; row metric choices are independent of the four top cards.
-- **Unwatch** is available on each row and in Settings. It stops collection and removes the repository from active views while retaining history; adding the same repository again resumes it. Technical collection diagnostics are under **Logs**.
+- Repository rows default to **recent activity**, with a remembered name/activity choice in Settings. The small cog above the rows opens **Repository graphs** directly; row metric choices are independent of the four top cards. **Show graph labels** repeats metric names throughout long lists and can be toggled in Settings.
+- An eye beside each project name identifies a public repository; a crossed-out eye identifies a private one. Hover for the label. Archived status remains separate.
+- **Unwatch** is available in Settings and the repository detail view, keeping overview rows uncluttered. It stops collection and removes the repository from active views while retaining history; adding the same repository again resumes it. Technical collection diagnostics are under **Logs**.
 
 ## Activity that explains what happened
 
@@ -84,7 +89,7 @@ Repository activity is stored separately from metric observations, so adding fee
 - Four cards default to **Commits, Stars, Views, Open issues**. Settings and on-card selectors persist your choices in the browser. Unavailable selected metrics are omitted, not replaced with unrelated ones.
 - Open-issue counts turn yellow strictly above **1**, red strictly above **3**. Thresholds are configurable; pull requests are excluded from issue counts.
 - Graphs default to **Cumulative**. Event totals accumulate within the selected range; balances are never summed again. The Daily toggle is remembered. Tables and CSV retain raw values.
-- Event fills use a zero baseline; missing days remain gaps. An initial balance observation is one point, not an invented flat history. Older retained balances keep their collection timestamp even outside a shorter chart window.
+- Empty graphs show a full-width zero baseline as a visual reference, not a claim that missing observations were zero. Missing days in a populated series remain gaps. An initial balance observation is one point, not an invented flat history. Older retained balances keep their collection timestamp even outside a shorter chart window.
 - Partial history does not support an unqualified growth comparison. Diagnostics retain permission, pagination, and rate-limit failures without replacing good data with zeros.
 - Daily traffic totals can be summed; daily unique visitors are not summed and called unique people.
 - Public and authenticated budgets are separate and persisted. Deferred repositories and metric families rotate across cycles.

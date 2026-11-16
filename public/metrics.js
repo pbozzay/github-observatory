@@ -103,7 +103,8 @@ export function chartView(metric,dates,mode='cumulative') {
 export function chart(points, {small=false,kind='balance',compact=false,width=390}={}) {
   const w=small?180:width, h=small?38:compact?100:180, left=small?4:42, right=w-8, top=small?4:12, bottom=h-(small?4:compact?20:26);
   const known=points.filter(p=>finite(p.value));
-  if (!known.length) return '';
+  // A zero reference is an axis, not an observation; retain every null gap.
+  const zeroReference=known.every(p=>p.value===0);
   const max=Math.max(1,...known.map(p=>p.value)), min=Math.min(0,...known.map(p=>p.value));
   const coords=points.map((p,i)=>finite(p.value)?{...p,x:points.length===1?(left+right)/2:left+i*(right-left)/(points.length-1),y:bottom-(p.value-min)/(max-min)*(bottom-top)}:null);
   const segments=[]; let current=[];
@@ -121,7 +122,7 @@ export function chart(points, {small=false,kind='balance',compact=false,width=39
     const d=segment.map((p,i)=>`${i?'L':'M'}${p.x},${p.y}`).join(' ');
     return `<path class="chart-area" d="${d} L${segment.at(-1).x},${zero} L${segment[0].x},${zero} Z"/><path class="chart-line" d="${d}"/>`;
   }).join('');
-  const baseline=`<line class="chart-baseline" x1="${left}" y1="${zero}" x2="${right}" y2="${zero}"/>`;
+  const baseline=`<line class="chart-baseline${zeroReference?' chart-zero-reference':''}" x1="${left}" y1="${zero}" x2="${right}" y2="${zero}"/>`;
   const hits=small?'':coords.filter(Boolean).map(p=>`<circle class="chart-hit" cx="${p.x}" cy="${p.y}" r="5"><title>${escapeHTML(p.date)}: ${fmt(p.value)}</title></circle>`).join('');
   const axes=small?'':`<line class="chart-grid" x1="${left}" y1="${bottom}" x2="${right}" y2="${bottom}"/><text class="chart-axis" x="0" y="16">${fmt(max)}</text><text class="chart-axis" x="0" y="${bottom}">${fmt(min)}</text><text class="chart-axis" x="${left}" y="${h-4}">${escapeHTML(points[0]?.date)}</text><text class="chart-axis" text-anchor="end" x="${right}" y="${h-4}">${escapeHTML(points.at(-1)?.date)}</text>`;
   return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" aria-hidden="true">${axes}${baseline}${paths}${hits}</svg>`;

@@ -33,6 +33,12 @@ export function createServer({service,publicDir,unlockKey,publicOrigin,proxyKey,
  const external=validateProxyConfiguration({publicOrigin,proxyKey});
  if(typeof unlockKey!=='string'||!unlockKey)throw new Error('Local unlock key required.');
  const files=publicFiles(publicDir),sessions=new Map();let failures=[];let syncing=false;
+ // Presentation hint only. Every request still passes the proxy/session gates below.
+ const index=files.get('/index.html');
+ if(index){
+  const rendered={...index,content:Buffer.from(index.content.toString('utf8').replace('data-auth-mode="local"',`data-auth-mode="${external?'proxy':'local'}"`))};
+  files.set('/index.html',rendered);files.set('/',rendered);
+ }
  const server=http.createServer(async(req,res)=>{
   const headers={'Cache-Control':'private, no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer','X-Frame-Options':'DENY','Cross-Origin-Resource-Policy':'same-origin','Content-Security-Policy':"default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",'Permissions-Policy':'camera=(), microphone=(), geolocation=()'};
   const send=(code,payload,type='application/json; charset=utf-8',extra={})=>{res.writeHead(code,{...headers,'Content-Type':type,...extra});res.end(type.startsWith('application/json')?JSON.stringify(payload):payload);};
