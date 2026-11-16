@@ -67,7 +67,7 @@ Use the same data directory when starting and opening a local instance. For Dock
 - Click a repository metric or sparkline to open its data modal. Commit, merged-PR, release, and current open-issue records link to the corresponding GitHub objects when collected.
 - Open-issue records describe the latest complete **current snapshot**, not the historic state at the selected chart date. Collection failures retain the prior snapshot and remain visible.
 - Metrics without individual records show actual observations plus appropriate GitHub destinations: stargazers, forks, traffic, and repository activity. Counts are never turned into invented records.
-- Tables preserve raw daily values even in Cumulative mode. Unknown is not zero. Pagination, incomplete coverage, and stale observations are explicitly identified.
+- Tables preserve raw daily values even in Totals over history mode. Unknown is not zero. Pagination, incomplete coverage, and stale observations are explicitly identified.
 - Repository names still open a full history view. Modals support keyboard access, Escape, focus restoration, and mobile scrolling.
 - Repository rows default to **recent activity**, with a remembered name/activity choice in Settings. The small cog above the rows opens **Repository graphs** directly; row metric choices are independent of the four top cards. **Show graph labels** repeats metric names throughout long lists and can be toggled in Settings.
 - An eye beside each project name identifies a public repository; a crossed-out eye identifies a private one. Hover for the label. Archived status remains separate.
@@ -83,12 +83,20 @@ The repository Events API adds observed stars and forks with actor profile links
 
 Repository activity is stored separately from metric observations, so adding feed events cannot inflate commit counts or erase existing chart history. Duplicate merge/release records are reconciled with authoritative endpoint records. Old databases upgrade without deleting observations; legacy commit titles become available after a successful refresh, rather than being guessed from a hash.
 
+## An inbox for your watched repositories
+
+The notification bell collects other people's pull requests, issues, comments and reviews on **verified owned repositories** you watch. Open the inbox to filter unread/all items, follow the GitHub link, mark one item read, or mark everything in the displayed snapshot read. New arrivals after that snapshot stay unread. Read state survives restarts.
+
+This is a **local Observatory inbox**, not a mirror of GitHub's notification inbox. It uses the same bounded Events collection described above and cannot guarantee every mention or event. It does not request broader credentials or change GitHub's read state. Missing identity/access, stale coverage and failures are shown rather than presented as a healthy empty inbox. Third-party repositories and your own actions are excluded. See the [notification contract](docs/notifications.md).
+
 ## Data, not demo numbers
 
-- Current stars/forks are observed balances, not reconstructed history. Stars defaults to **Total stars**, plotting recorded balances. A remembered **Total stars / Stars gained** control switches every Stars graph; gains can be daily or cumulative and do not subtract unstarring. The headline is explicitly labeled Total stars in either view. Total-star aggregates use every headline contributor and leave dates with missing balances unknown; differing latest observation dates are identified as not comparable. A narrower gains cohort is disclosed separately.
+- Graphs default to **Totals over history**, with a shared, remembered **Daily activity** alternative in the toolbar and Settings. Changing the date range zooms the history graph; it does not restart the historical total at zero. An explicit older Daily preference is retained. All eight metric families use the same mode; raw daily tables and CSV are unchanged.
+- Commits, merged PRs and releases progressively backfill accessible records into SQLite with durable resume checkpoints. Completed old pages are not re-downloaded on every ordinary refresh. Backfill, limited coverage and collection failures remain explicit; a cache is not proof of exhaustive GitHub history.
+- Stars and forks combine real observed balances with reconciled historical surviving-cohort reconstructions where available. Reconstructed history is labeled and is **not an exact record of past outstanding balances**: removed stars and deleted forks can be absent. Observations take precedence. Aggregates use the full headline contributor cohort, leave missing dates unknown and identify non-comparable observation dates.
+- Views and clones accumulate retained daily totals, not inaccessible lifetime traffic. GitHub provides a rolling 14-day window; older data exists only if previously collected. Open issues use observed outstanding balances, not sums of issue creation/closure dates.
 - Four cards default to **Commits, Stars, Views, Open issues**. Settings and on-card selectors persist your choices in the browser. Selected unavailable metrics remain visible as grey placeholders in cards and repository rows, with an explanation instead of an invented zero. **Disabled on repo** requires a verified repository setting; missing access, collection failures and observations not yet collected are distinguished.
 - Open-issue counts turn yellow strictly above **1**, red strictly above **3**. Thresholds are configurable; pull requests are excluded from issue counts.
-- Graphs default to **Cumulative**. Event totals accumulate within the selected range; balances are never summed again. The Daily toggle is remembered. Tables and CSV retain raw values.
 - Empty graphs show a full-width zero baseline as a visual reference, not a claim that missing observations were zero. Missing days in a populated series remain gaps. An initial balance observation is one point, not an invented flat history. Older retained balances keep their collection timestamp even outside a shorter chart window.
 - Partial history does not support an unqualified growth comparison. Diagnostics retain permission, pagination, and rate-limit failures without replacing good data with zeros.
 - Daily traffic totals can be summed; daily unique visitors are not summed and called unique people.

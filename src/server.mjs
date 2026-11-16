@@ -2,6 +2,7 @@ import http from 'node:http';
 import { randomBytes, createHash, timingSafeEqual } from 'node:crypto';
 import { readFileSync, readdirSync, lstatSync } from 'node:fs';
 import { join, relative } from 'node:path';
+import { notificationQuery, unavailableNotifications } from './notifications.mjs';
 
 const MIME={'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8','.svg':'image/svg+xml','.png':'image/png','.ico':'image/x-icon'};
 const safeEqual=(a,b)=>timingSafeEqual(createHash('sha256').update(String(a)).digest(),createHash('sha256').update(String(b)).digest());
@@ -29,7 +30,7 @@ export function validateProxyConfiguration({publicOrigin,proxyKey}={}){
  return external;
 }
 
-export function createServer({service,publicDir,unlockKey,publicOrigin,proxyKey,logger=()=>{},now=()=>Date.now()}){
+export function createServer({service,notifications,publicDir,unlockKey,publicOrigin,proxyKey,logger=()=>{},now=()=>Date.now()}){
  const external=validateProxyConfiguration({publicOrigin,proxyKey});
  if(typeof unlockKey!=='string'||!unlockKey)throw new Error('Local unlock key required.');
  const files=publicFiles(publicDir),sessions=new Map();let failures=[];let syncing=false;
@@ -75,6 +76,17 @@ export function createServer({service,publicDir,unlockKey,publicOrigin,proxyKey,
     if(!authenticated)throw problem(401,'Unlock required.');
     if(req.method!=='GET'){
      if(req.headers.origin!==origin||typeof req.headers['x-csrf-token']!=='string'||!safeEqual(req.headers['x-csrf-token'],session.csrf))throw problem(403,'Request not permitted.');
+    }
+    if(req.method==='GET'&&route==='/api/notifications'){
+     for(const key of url.searchParams.keys())if(!['offset','limit','unread'].includes(key)||url.searchParams.getAll(key).length>1)throw problem(400,'Invalid notification query.');
+     const query=notificationQuery(Object.fromEntries(url.searchParams));
+     send(200,notifications?notifications.list(query):unavailableNotifications(query));return;
+    }
+    if(req.method==='POST'&&(route==='/api/notifications/read'||route==='/api/notifications/read-all')){
+     const body=await jsonBody(req),field=route.endsWith('/read-all')?'through':'id';
+     if(Object.keys(body).length!==1||!Object.hasOwn(body,field))throw problem(400,'Invalid notification request.');
+     if(!notifications)throw problem(503,'Notifications are not configured.');
+     send(200,field==='id'?notifications.markRead(body):notifications.markAllRead(body));return;
     }
     if(req.method==='GET'&&route==='/api/dashboard'){send(200,service.dashboard(rangeOf(url)));return;}
     if(req.method==='GET'&&route==='/api/status'){send(200,service.status());return;}

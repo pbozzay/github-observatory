@@ -22,6 +22,7 @@ function mockGitHub(overrides = {}) {
       if (key === '/user/repos') value = [metadata()];
       else if (key.endsWith('/commits')) value = [{ sha: 'abc123', commit: { committer: { date: '2026-06-19T03:00:00Z', email: 'never-store@example.invalid' }, message: 'Actual commit title\n\nBounded descriptive context' }, author: { login: 'contributor' } }];
       else if (key.endsWith('/events')) value = [];
+      else if (key.endsWith('/forks')) value = [];
       else if (key.endsWith('/pulls')) value = [{ number: 12, merged_at: '2026-06-18T05:00:00Z', updated_at: '2026-06-18T05:00:00Z', title: 'Merged change', user: { login: 'contributor' } }, { number: 13, merged_at: null, updated_at: '2026-06-18T05:00:00Z' }];
       else if (key.endsWith('/releases')) value = [{ id: 42, published_at: '2026-06-17T03:00:00Z', name: 'v1', tag_name: 'v1', draft: false }];
       else if (key.endsWith('/issues')) value = [{ id: 1, number: 1 }, { id: 2, number: 2, pull_request: {} }];
@@ -174,7 +175,10 @@ test('partial event pagination never zero-fills and preserves last good endpoint
   truncate = true;
   await service.sync();
   let metric = service.dashboard('7').repos[0].metrics.commits;
-  assert.equal(metric,undefined);
+  assert.equal(metric.value, 1, 'validated backfill pages now retain real counts even while recent pagination is incomplete');
+  assert.equal(metric.points.filter(point => point.value !== null).length, 1);
+  assert.equal(metric.coverage.complete, false);
+  assert.equal(metric.history.status, 'backfilling');
   assert.equal(service.status().runs.find(r=>r.metric==='commits').status,'partial');
   truncate = false;
   await service.sync();
@@ -330,7 +334,7 @@ test('interrupted endpoint attempts recover with good history and idempotent ret
   } finally { await restored.close(); }
 });
 
-test('all range caps retained history and excludes out-of-range totals', async t => {
+test('all range exposes its GitHub-era limit while history totals retain earlier cached counts', async t => {
   const { service, directory } = await fixture(t);
   await service.addWatch({ repository: 'example/sample', access: 'public' });
   const db = new DatabaseSync(join(directory, 'test.sqlite'));
@@ -338,7 +342,9 @@ test('all range caps retained history and excludes out-of-range totals', async t
   db.prepare('INSERT INTO points VALUES(?,?,?,?,?)').run('101', 'commits', '2026-06-10', 10, NOW);
   db.prepare('INSERT INTO points VALUES(?,?,?,?,?)').run('101', 'commits', '2026-06-20', 2, NOW);
   db.close();
-  assert.equal(service.dashboard('all').dates.length, 3660);
+  assert.equal(service.dashboard('all').dates[0], '2008-01-01');
+  assert.equal(service.dashboard('all').rangeLimit.truncated, true);
+  assert.equal(service.dashboard('all').repos[0].metrics.commits.history.value, 1011);
   assert.equal(service.dashboard('all').repos[0].metrics.commits.value, 12);
   assert.equal(service.dashboard('7').repos[0].metrics.commits.value, 2);
 });

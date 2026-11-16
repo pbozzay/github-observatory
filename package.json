@@ -1,6 +1,6 @@
 {
   "name": "github-observatory",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "private": true,
   "description": "See what is happening across your GitHub projects: commits, stars, issues, and traffic in one self-hosted dashboard.",
   "type": "module",

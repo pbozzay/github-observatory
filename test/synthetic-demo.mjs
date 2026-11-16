@@ -54,6 +54,7 @@ export async function installSyntheticDemo(context,{dashboard=syntheticDashboard
       calls.push({path:url.pathname,query:Object.fromEntries(url.searchParams),method:route.request().method()});
       if(api&&await api({url,route,send,calls}))return;
       if(url.pathname==='/api/session')return send({ok:true,csrf:'synthetic-demo-csrf'});
+      if(url.pathname==='/api/notifications')return send({items:[],total:0,unreadCount:0,offset:0,limit:50,hasMore:false,snapshot:0,coverage:{complete:false,label:'Synthetic retained events'},status:'ready',updatedAt:null});
       if(url.pathname==='/api/dashboard')return send(dashboard);
       if(url.pathname==='/api/details')return details?details({url,route,send,calls}):send(syntheticDetails(url,dashboard));
       if(url.pathname==='/api/events')return send(syntheticEvents(url,dashboard));

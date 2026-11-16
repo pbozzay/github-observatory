@@ -1,4 +1,4 @@
-// Only observed values are charted. Unknown is never coerced to zero.
+// Only known values are charted. Reconstructed history is labeled; unknown is never zero.
 export const finite = value => typeof value === 'number' && Number.isFinite(value);
 export const escapeHTML = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 export const fmt = value => finite(value) ? new Intl.NumberFormat().format(value) : '';
@@ -50,14 +50,33 @@ export function collectionWarning(repo,key){
 export function missingMetric(repo,key) {
   return {label:CARD_METRICS[key],value:null,points:[],unit:'',unavailableReason:unavailableReason(repo,key)};
 }
-export function presentRepository(repo,starMode='total') {
-  const rawMetrics=repo.rawMetrics || repo.metrics || {},{star_activity:activity,...metrics}=rawMetrics;
-  if(observed(metrics.stars)){
-    metrics.stars={...metrics.stars,starMode,countLabel:'Total stars'};
-    if(starMode==='gained')metrics.stars={...metrics.stars,points:activity?.points||[],chartKind:'event',chartLabel:'Daily stars gained',chartCoverage:activity?.coverage||{start:null,end:null,complete:false},chartSource:activity?.source,chartLastSuccess:activity?.lastSuccess,chartStatus:activity?.status,
-      chartUnavailableReason:activity?.points?.some(p=>finite(p.value))?null:observed(activity)?'No observations in this range':unavailableReason(repo,'star_activity')};
+// The old independent stars/gained preference is intentionally superseded.
+// History is authoritative, including null counts. Raw metrics remain untouched.
+export function historyNote(metric){
+  const h=metric.history;if(!h)return metric.kind==='balance'?'Recorded balance · since tracking':'Recorded history · selected range only';
+  const status={backfilling:'Backfilling',limited:'Limited history',no_access:'No access',error:'History collection failed',not_collected:'Not collected yet'}[h.status];
+  return [...new Set([h.label||'Recorded history',h.kind==='reconstructed'&&!/reconstruct/i.test(h.label||'')?'Reconstructed':h.kind==='retained'&&!/retained/i.test(h.label||'')?'Retained history':null,status,!h.complete?'Partial history':null].filter(Boolean))].join(' · ');
+}
+function runningPoints(points){let total=0;return (points||[]).map(p=>({...p,value:finite(p.value)?(total+=p.value):null}));}
+export function presentRepository(repo,mode='totals') {
+  const rawMetrics=repo.rawMetrics || repo.metrics || {},metrics={};
+  for(const [key,raw] of Object.entries(rawMetrics)){
+    if(key==='star_activity')continue;
+    const h=raw.history, daily=mode==='daily',balance=raw.kind==='balance';
+    const source=daily&&key==='stars'?rawMetrics.star_activity:raw;
+    const dailyEvent=daily&&(key==='stars'||!balance);
+    const points=dailyEvent?source?.points||[]:h?h.points||[]:balance?raw.points||[]:runningPoints(raw.points);
+    const chartLabel=dailyEvent?(key==='stars'?'Daily stars gained · current surviving stars':'Daily activity'):
+      h?(balance&&h.kind==='recorded'?'Recorded balance':'Totals over history'):
+      balance?'Recorded balance':'Recorded history · selected range only';
+    metrics[key]={...raw,value:h?(finite(h.value)?h.value:null):raw.value,points,delta:null,presentationMode:daily?'daily':'totals',rawMetric:source||{points:[]},observedBalance:balance?{observedAt:raw.observedAt,points:raw.points}:undefined,
+      countLabel:key==='stars'?'Total stars':balance&&(!h||h.kind==='recorded')?'Recorded balance':h?'History total':'Recorded history',
+      chartKind:dailyEvent?'event':'balance',chartLabel,
+      chartCoverage:dailyEvent?source?.coverage:h?{start:h.from,end:points.findLast(p=>finite(p.value))?.date??null,complete:h.complete&&points.length>0&&points.every(p=>finite(p.value))}:raw.coverage,
+      chartSource:source?.source,chartLastSuccess:source?.lastSuccess,chartStatus:source?.status,
+      chartUnavailableReason:points.some(p=>finite(p.value))?null:dailyEvent&&key==='stars'?(observed(source)?'No observations in this range':unavailableReason(repo,'star_activity')):h?.status==='no_access'?'No access':h?.status==='backfilling'?'Backfilling history':h?.status==='error'?'History collection failed':null};
   }
-  // Preserve legacy event ordering even when the public Stars graph is a balance.
+  // Backfill/collection freshness must never reorder actual event activity.
   const lastActivityAt=Object.hasOwn(repo,'lastActivityAt')?repo.lastActivityAt:new Date(repositoryActivity({...repo,metrics:rawMetrics})).toISOString();
   return {...repo,lastActivityAt,rawMetrics,metrics};
 }
@@ -90,47 +109,55 @@ function observationDay(value){
   return Number.isFinite(time)?new Date(time).toISOString().slice(0,10):null;
 }
 function latestBalanceDay(metric){
+  metric=metric.observedBalance||metric;
   return observationDay(metric.observedAt)||(metric.points||[]).filter(p=>finite(p.value)).map(p=>observationDay(p.date)).filter(Boolean).sort().at(-1)||null;
 }
-// A fixed cohort prevents a changing contributor set from inventing movement.
-// Event totals require identical observed-day masks; balance totals require the
-// same latest observation date. Detail exposes the selected cohort and coverage.
-export function aggregate(repos, key, dates) {
-  const groups=new Map(),counted=[];
-  for(const repo of repos){
-    const m=repo.metrics?.[key];if(!observed(m)||!finite(m.value))continue;
-    counted.push({repo,metric:m});
-    const points=aligned(m,dates),known=points.filter(p=>finite(p.value));
-    if(!known.length)continue;
-    const chartKind=m.chartKind||m.kind,coverage=m.chartCoverage||m.coverage;
-    const mask=chartKind==='event'?known.map(p=>p.date).join(','):known.at(-1).date;
-    const signature=JSON.stringify([chartKind,m.unit,mask,coverage?.start,coverage?.end]);
-    if(!groups.has(signature))groups.set(signature,[]);
-    groups.get(signature).push({repo,metric:m,points});
-  }
-  let candidates=[...groups.values()];
-  if(key==='stars'&&counted.some(x=>x.metric.chartKind==='event'))candidates=candidates.filter(c=>c[0].metric.chartKind==='event');
-  const totalStars=key==='stars'&&counted.length>0&&counted.every(x=>(x.metric.chartKind||x.metric.kind)==='balance');
-  // Total stars must use ALL headline contributors, even with differing starts.
-  const cohort=totalStars?counted.map(x=>({...x,points:aligned(x.metric,dates)})):candidates.sort((a,b)=>b.length-a.length||b[0].points.filter(p=>finite(p.value)).length-a[0].points.filter(p=>finite(p.value)).length)[0]||[];
-  if(!cohort.length && !(key==='stars'&&counted.length))return null;
-  const totals=key==='stars'?counted:cohort,first=(cohort[0]||totals[0]).metric;
-  const points=dates.map((date,i)=>({date,value:cohort.length&&cohort.every(x=>finite(x.points[i].value))?cohort.reduce((sum,x)=>sum+x.points[i].value,0):null}));
-  const coverage={start:points.find(p=>finite(p.value))?.date??null,end:points.findLast(p=>finite(p.value))?.date??null,complete:cohort.length>0&&points.length>0&&points.every(p=>finite(p.value))&&cohort.every(x=>(x.metric.chartCoverage||x.metric.coverage)?.complete===true)};
-  return {...first,status:combinedStatus(totals.map(x=>x.metric.status)),
-    ...(key==='stars'&&first.chartKind==='event'&&!cohort.length?{chartUnavailableReason:[...new Set(totals.map(x=>x.metric.chartUnavailableReason||'No observations in this range'))].join(' · ')}:{}),
-    ...(first.chartKind?{chartCoverage:coverage,chartStatus:combinedStatus(cohort.map(x=>x.metric.chartStatus)),chartLastSuccess:cohort.map(x=>x.metric.chartLastSuccess).filter(Boolean).sort()[0]??null,chartSource:[...new Set(cohort.map(x=>x.metric.chartSource).filter(Boolean))].join('; ')}:{}),
-    value:totals.reduce((s,x)=>s+x.metric.value,0),delta:totals.every(x=>finite(x.metric.delta)&&x.metric.coverage?.complete)?totals.reduce((s,x)=>s+x.metric.delta,0):null,
-    points,coverage,chartComparable:!totalStars||!!latestBalanceDay(first)&&cohort.every(x=>latestBalanceDay(x.metric)===latestBalanceDay(first)),
-    contributors:totals.map(x=>x.repo),chartContributors:cohort.map(x=>x.repo),lastSuccess:totals.map(x=>x.metric.lastSuccess).filter(Boolean).sort()[0]??null};
+function mergeHistories(histories,value,points,allCounted){
+  if(!histories.some(Boolean))return undefined;
+  const statuses=histories.map(h=>h?.status||'limited');
+  const status=['error','no_access','backfilling','not_collected','limited'].find(s=>statuses.includes(s))||'complete';
+  const kinds=[...new Set(histories.map(h=>h?.kind||'recorded'))];
+  return {value,points,baseline:histories.every(h=>finite(h?.baseline))?histories.reduce((sum,h)=>sum+h.baseline,0):null,
+    from:histories.every(h=>h?.from)?histories.map(h=>h.from).sort()[0]:null,
+    complete:allCounted&&histories.every(h=>h?.complete===true)&&status==='complete',status,
+    kind:kinds.includes('reconstructed')?'reconstructed':kinds.includes('retained')?'retained':'recorded',
+    label:[...new Set(histories.map(h=>h?.label||'Recorded history · selected range only'))].join(' · ')};
 }
-export function chartView(metric,dates,mode='cumulative') {
-  const points=aligned(metric,dates),event=(metric.chartKind||metric.kind)==='event',cumulative=event&&mode==='cumulative';
-  let total=0;
-  return {points:cumulative?points.map(p=>({...p,value:finite(p.value)?(total+=p.value):null})):points,
-    kind:cumulative?'balance':metric.chartKind||metric.kind,
-    label:event?(metric.chartLabel?metric.chartLabel.replace(/^Daily /,cumulative?'Cumulative ':'Daily '):cumulative?'Cumulative in range':'Daily observations'):metric.starMode==='total'?'Total stars · observed balance':'Observed balance',
-    cumulative};
+// Every plotted point uses ALL headline contributors. Never substitute a
+// smaller, better-covered cohort underneath a larger headline count.
+export function aggregate(repos, key, dates) {
+  const all=repos.map(repo=>({repo,metric:repo.metrics?.[key]?.presentationMode?repo.metrics[key]:presentRepository(repo).metrics[key]})),counted=all.filter(x=>finite(x.metric?.value));
+  if(!counted.length){
+    const first=all.find(x=>x.metric?.history)?.metric;if(!first)return null;
+    const points=dates.map(date=>({date,value:null})),history=mergeHistories(all.map(x=>x.metric?.history),null,points,false);
+    return {...first,value:null,points,history,contributors:[],chartContributors:[],chartCoverage:{complete:false},chartUnavailableReason:historyNote({history})};
+  }
+  const first=counted[0].metric;
+  const sumPoints=select=>{
+    const series=counted.map(x=>aligned(select(x.metric)||{},dates));
+    return dates.map((date,i)=>({date,value:series.every(p=>finite(p[i].value))?series.reduce((sum,p)=>sum+p[i].value,0):null}));
+  };
+  const points=sumPoints(m=>m),value=counted.reduce((sum,x)=>sum+x.metric.value,0);
+  const history=mergeHistories(all.map(x=>x.metric?.history),value,sumPoints(m=>m.history||m),counted.length===repos.length);
+  if(history)history.baseline=counted.every(x=>finite(x.metric.history?.baseline))?counted.reduce((sum,x)=>sum+x.metric.history.baseline,0):null;
+  const coverage={start:points.find(p=>finite(p.value))?.date??null,end:points.findLast(p=>finite(p.value))?.date??null,
+    complete:counted.length===repos.length&&points.length>0&&points.every(p=>finite(p.value))&&counted.every(x=>(x.metric.chartCoverage||x.metric.coverage)?.complete===true)};
+  const balances=counted.filter(x=>x.metric.kind==='balance'&&(!x.metric.history||x.metric.history.kind==='recorded'));
+  const chartComparable=balances.length<2||!!latestBalanceDay(balances[0].metric)&&balances.every(x=>latestBalanceDay(x.metric)===latestBalanceDay(balances[0].metric));
+  return {...first,history,value,points,delta:null,coverage,chartCoverage:coverage,chartComparable,
+    status:combinedStatus(counted.map(x=>x.metric.status)),chartStatus:combinedStatus(counted.map(x=>x.metric.chartStatus)),
+    chartLastSuccess:counted.map(x=>x.metric.chartLastSuccess).filter(Boolean).sort()[0]??null,
+    chartSource:[...new Set(counted.map(x=>x.metric.chartSource).filter(Boolean))].join('; '),
+    chartUnavailableReason:[...new Set(counted.map(x=>x.metric.chartUnavailableReason).filter(Boolean))].join(' · ')||null,
+    rawMetric:{points:sumPoints(m=>m.rawMetric||m),unit:first.rawMetric?.unit||first.unit,kind:first.rawMetric?.kind||first.kind},
+    contributors:counted.map(x=>x.repo),chartContributors:counted.map(x=>x.repo),
+    lastSuccess:counted.map(x=>x.metric.lastSuccess).filter(Boolean).sort()[0]??null};
+}
+export function chartView(metric,dates,mode='totals') {
+  // Presentation points (including backend history) are already in graph units.
+  // Mode changes are projected from raw metrics, never from an earlier graph.
+  const m=metric.presentationMode?metric:presentRepository({metrics:{metric}},mode).metrics.metric;
+  return {points:aligned(m,dates),kind:m.chartKind||m.kind,label:m.chartLabel||'Recorded history'};
 }
 export function chart(points, {small=false,kind='balance',compact=false,width=390}={}) {
   const w=small?180:width, h=small?38:compact?100:180, left=small?4:42, right=w-8, top=small?4:12, bottom=h-(small?4:compact?20:26);
@@ -166,6 +193,6 @@ export function csvCell(value) {
 }
 export function exportCSV(repos,range) {
   const rows=[['repository','metric','value','unit','range','coverage_start','coverage_end','coverage_complete','last_success']];
-  for(const r of repos)for(const key of keys(r)){const m=r.rawMetrics?.[key]||r.metrics[key];rows.push([r.owner+'/'+r.name,m.label,m.value,m.unit,range,m.coverage?.start,m.coverage?.end,m.coverage?.complete,m.lastSuccess]);}
+  for(const r of repos)for(const key of keys({metrics:r.rawMetrics||r.metrics}).filter(k=>k!=='star_activity')){const m=r.rawMetrics?.[key]||r.metrics[key];rows.push([r.owner+'/'+r.name,m.label,m.value,m.unit,range,m.coverage?.start,m.coverage?.end,m.coverage?.complete,m.lastSuccess]);}
   return rows.map(row=>row.map(csvCell).join(',')).join('\r\n');
 }

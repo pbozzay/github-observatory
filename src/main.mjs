@@ -6,6 +6,7 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createServer, validateProxyConfiguration } from './server.mjs';
 import { createObservatory } from './data.mjs';
+import { createNotifications, withNotifications } from './notifications.mjs';
 
 process.umask(0o077);
 const port=Number(process.env.OBSERVATORY_PORT||47831);
@@ -22,10 +23,15 @@ const keyPath=join(state,'unlock-key');
 let key;
 try{key=await readSecretFile(keyPath);}catch(e){if(e.code!=='ENOENT')throw e;key=randomBytes(32).toString('base64url');await writeFile(keyPath,key+'\n',{mode:0o600,flag:'wx'});}
 if(!/^[A-Za-z0-9_-]{40,}$/.test(key))throw new Error('Invalid local unlock file.');
-const service=await createObservatory({dbPath:join(state,'observatory.sqlite'),token});
-let server;
-try{server=createServer({service,publicDir:join(root,'public'),unlockKey:key,publicOrigin,proxyKey,logger:message=>console.error(message)});}
-catch(error){await service.close();throw error;}
+const observatory=await createObservatory({dbPath:join(state,'observatory.sqlite'),token});
+let service=observatory,notifications,server;
+try{
+ // The primary writer is held before the private inbox is opened. Its own
+ // stable SQLite lock also protects standalone initialization and test use.
+ notifications=createNotifications({dbPath:join(state,'notifications.sqlite'),service:observatory});
+ service=withNotifications(observatory,notifications);
+ server=createServer({service,notifications,publicDir:join(root,'public'),unlockKey:key,publicOrigin,proxyKey,logger:message=>console.error(message)});
+}catch(error){try{await notifications?.close();}finally{await observatory.close();}throw error;}
 let interval;
 const period=60*60*1000;
 async function collect(){

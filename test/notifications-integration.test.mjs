@@ -1,0 +1,55 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import { createObservatory } from '../src/data.mjs';
+import { createNotifications, withNotifications } from '../src/notifications.mjs';
+import { createServer } from '../src/server.mjs';
+
+test('real retained GitHub Events and verified context feed a durable HTTP inbox with no GET collection', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'observatory-notifications-integration-'));
+  const date = '2026-06-19T03:04:05.000Z', now = () => new Date('2026-06-20T12:00:00Z');
+  const repository = { id: 101, name: 'sample', owner: { login: 'viewer' }, private: false, archived: false, default_branch: 'main', stargazers_count: 7, forks_count: 2 };
+  const event = (id, type, payload, login = 'other') => ({ id: String(id), type, payload, actor: { login }, repo: { id: 101 }, created_at: date });
+  const feed = [event(1, 'PullRequestEvent', { action: 'opened', pull_request: { number: 7, title: 'Synthetic pull request' } }), event(2, 'PullRequestEvent', { action: 'opened', pull_request: { number: 8 } }, 'viewer'), event(3, 'IssueCommentEvent', { action: 'created', issue: { number: 7, pull_request: {} }, comment: { id: 90, body: '@viewer private@example.invalid', html_url: 'https://github.com/viewer/sample/pull/7#issuecomment-90' } }), event(4, 'WatchEvent', { action: 'started' })];
+  const calls = [];
+  const config = { dbPath: join(root, 'observatory.sqlite'), token: 'synthetic-test-token', now, fetchImpl: async input => {
+    const url = new URL(input); calls.push(url.pathname);
+    assert.equal(url.origin, 'https://api.github.com');
+    if (url.pathname === '/user') return Response.json({ login: 'viewer' });
+    const endpoint = url.pathname.split('/').slice(4).join('/');
+    if (!endpoint) return Response.json(repository);
+    if (endpoint === 'events') return Response.json(feed);
+    if (endpoint === 'traffic/views') return Response.json({ views: [] });
+    if (endpoint === 'traffic/clones') return Response.json({ clones: [] });
+    assert.ok(['issues', 'commits', 'pulls', 'releases', 'stargazers/history'].includes(endpoint));
+    return Response.json([]);
+  } };
+  let raw = await createObservatory(config), inbox = createNotifications({ dbPath: join(root, 'notifications.sqlite'), service: raw, now }), service = withNotifications(raw, inbox), server;
+  t.after(async () => { if (server) await new Promise(resolve => server.close(resolve)); await service.close(); await rm(root, { recursive: true, force: true }); });
+  await service.addWatch({ repository: 'viewer/sample', access: 'token' });
+  await service.sync();
+  assert.equal(inbox.list().total, 2); assert.equal(calls.filter(path => path === '/user').length, 1);
+  const comment = inbox.list().items.find(item => item.type === 'issue_comment');
+  assert.equal(comment.url, 'https://github.com/viewer/sample/pull/7#issuecomment-90');
+  server = createServer({ service, notifications: inbox, publicDir: root, unlockKey: 'synthetic-key' });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const login = await fetch(base + '/api/session', { method: 'POST', headers: { Origin: base, 'Content-Type': 'application/json' }, body: JSON.stringify({ key: 'synthetic-key' }) });
+  const { csrf } = await login.json(); const cookie = login.headers.get('set-cookie').split(';')[0];
+  const before = calls.length;
+  const response = await fetch(base + '/api/notifications', { headers: { Cookie: cookie } });
+  assert.equal(response.status, 200); const result = await response.json(); assert.equal(result.total, 2); assert.equal(calls.length, before);
+  const read = await fetch(base + '/api/notifications/read-all', { method: 'POST', headers: { Cookie: cookie, Origin: base, 'Content-Type': 'application/json', 'X-CSRF-Token': csrf }, body: JSON.stringify({ through: result.snapshot }) });
+  assert.equal(read.status, 200); await read.text(); assert.equal(calls.length, before);
+  await new Promise(resolve => server.close(resolve)); server = null; await service.close();
+  raw = await createObservatory(config); inbox = createNotifications({ dbPath: join(root, 'notifications.sqlite'), service: raw, now }); service = withNotifications(raw, inbox);
+  assert.equal(inbox.list().status, 'error'); assert.match(inbox.list().coverage.label, /stale/);
+  assert.equal(inbox.list({ unread: false }).total, 2); assert.equal(inbox.list().unreadCount, 0);
+  await service.sync(); assert.equal(inbox.list().status, 'ready'); assert.equal(inbox.list().unreadCount, 0);
+  assert.equal(calls.some(path => path.includes('/notifications')), false);
+  const db = new DatabaseSync(join(root, 'notifications.sqlite'), { readOnly: true });
+  try { assert.equal(db.prepare('PRAGMA integrity_check').get().integrity_check, 'ok'); assert.ok(!JSON.stringify(db.prepare('SELECT * FROM notifications').all()).includes('private@example.invalid')); } finally { db.close(); }
+});

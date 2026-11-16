@@ -15,7 +15,8 @@ async function openFixture(t,dashboard){
     const url=new URL(route.request().url());assert.equal(url.hostname,'observatory.test');
     const send=body=>route.fulfill({contentType:'application/json',body:JSON.stringify(body)});
     if(url.pathname==='/api/session')return send({csrf:'fixture-csrf'});
-    if(url.pathname==='/api/dashboard')return send(dashboard);
+    if(url.pathname==='/api/notifications')return send({items:[],total:0,unreadCount:0,offset:0,limit:50,hasMore:false,snapshot:0,coverage:{complete:false,label:'Synthetic retained events'},status:'ready',updatedAt:null});
+      if(url.pathname==='/api/dashboard')return send(dashboard);
     if(url.pathname==='/api/details')return send({items:[],total:0,offset:0,limit:50,hasMore:false,kind:'observations',complete:false,status:'ok',observedAt:'2026-06-20T12:00:00Z'});
     assert.ok(!url.pathname.startsWith('/api/'));
     const name=url.pathname==='/'?'index.html':url.pathname.slice(1);
@@ -47,7 +48,7 @@ test('gains outside the window differ from entirely missing gains regardless of 
     repo('retained',{stars:balance('Stars',1433),star_activity:{...balance('Stars gained',15),kind:'event',points:dates.map(date=>({date,value:null}))}},{star_activity:{state:'available',label:'Available'}}),
     ...['no_access','error','not_collected'].map(state=>repo(state,{stars:balance('Stars',7)},{star_activity:{state}})),
   ]};
-  const page=await openFixture(t,dashboard);await page.click('[data-star-mode="gained"]');
+  const page=await openFixture(t,dashboard);await page.click('[data-chart-mode="daily"]');
   for(const [id,label] of [['retained','No observations in this range'],['no_access','No access'],['error','Collection failed'],['not_collected','Not collected yet']]){
     const row=page.locator(`[data-project="${id}"] [data-metric="stars"]`);
     assert.equal(await row.locator('.unavailable-label').textContent(),label);

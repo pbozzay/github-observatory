@@ -17,7 +17,7 @@ function data(){return {dates,updatedAt:'2025-01-03T10:00:00Z',collecting:false,
 
 test('metric invariants: compatible cohorts, null gaps, one point, links, CSV',()=>{
   const d=data(),m=aggregate(d.repos,'commits',dates);
-  assert.equal(m.value,10);assert.deepEqual(m.points.map(p=>p.value),[3,null,7]);assert.equal(m.contributors.length,2);
+  assert.equal(m.value,180);assert.deepEqual(m.points.map(p=>p.value),[null,null,180]);assert.equal(m.contributors.length,3);
   assert.equal(aggregate(d.repos,'stars',dates).value,3);
   assert.equal(aggregate(d.repos,'unknown',dates),null);
   const svg=chart(d.repos[0].metrics.stars.points);assert.match(svg,/chart-dot/);assert.doesNotMatch(svg,/class="chart-line"/);
@@ -44,6 +44,7 @@ test('frontend contract and responsive interactions',async t=>{
       }
       if(!authenticated||expired)return send({error:'locked'},401);
       if(request.method()==='POST')assert.equal(request.headers()['x-csrf-token'],'test-csrf');
+      if(url.pathname==='/api/notifications')return send({items:[],total:0,unreadCount:0,offset:0,limit:50,hasMore:false,snapshot:0,coverage:{complete:false,label:'Synthetic retained events'},status:'ready',updatedAt:null});
       if(url.pathname==='/api/dashboard')return failDashboard?send({error:'private upstream error must not render'},500):send({...dashboard,repos:[...dashboard.repos].reverse()});
       if(url.pathname==='/api/details')return send({items:[],total:0,hasMore:false,offset:Number(url.searchParams.get('offset')),limit:50,kind:'observations',observedAt:null,status:'ok',complete:false});
       if(url.pathname==='/api/discover')return send({repositories:[{id:'owned',owner:'test-owner',name:'owned-repository',visibility:'private',archived:false,watched:calls.some(c=>c.path==='/api/watches'&&c.body?.access==='token')}]});
@@ -77,13 +78,13 @@ test('frontend contract and responsive interactions',async t=>{
     assert.equal(await page.locator('.aggregate-panel').nth(3).getAttribute('data-aggregate'),'issues');
     assert.equal(await page.locator('[data-aggregate="issues"] strong').textContent(),'6');
     assert.match(await page.locator('[data-aggregate="issues"] .aggregate-value').getAttribute('class'),/issue-danger/);
-    assert.equal(await page.locator('[data-aggregate="commits"] .aggregate-value strong').textContent(),'10');
+    assert.equal(await page.locator('[data-aggregate="commits"] .aggregate-value strong').textContent(),'180');
     assert.equal(await page.locator('[data-project="one"] [data-metric="stars"] .spark-value').textContent(),'0');
     assert.equal(await page.locator('[data-project="one"] [data-metric="stars"] .chart-dot').count(),1);
     assert.equal(await page.locator('[data-metric="star_activity"]').count(),0);assert.equal(await page.locator('option[value="star_activity"]').count(),0);
     assert.equal(await page.locator('option').filter({hasText:'Unknown'}).count(),0);
     assert.equal(await page.locator('[data-project="two"] .visibility-icon').getAttribute('aria-label'),'Private repository');assert.equal(await page.locator('[data-project="one"] .visibility-icon').getAttribute('title'),'Public repository');assert.equal(await page.locator('[data-project="one"] .eye-slash').count(),0);assert.equal(await page.locator('[data-project="two"] .eye-slash').count(),1);assert.equal(await page.locator('[data-project="two"] .badge.archived').count(),1);
-    await page.click('[data-aggregate-detail="commits"]');assert.match(await page.locator('#dialog-body').textContent(),/2 of 3 filtered projects/);await page.keyboard.press('Escape');assert.equal(await page.locator('#dialog').isVisible(),false);
+    await page.click('[data-aggregate-detail="commits"]');assert.match(await page.locator('#dialog-body').textContent(),/3 of 3 filtered projects/);await page.keyboard.press('Escape');assert.equal(await page.locator('#dialog').isVisible(),false);
   });
   await t.test('Settings chooses all four cards and persists without losing choices under filters',async()=>{
     await page.click('#settings');assert.equal(await page.locator('[data-card-setting]').count(),4);assert.equal(await page.inputValue('#card-metric-3'),'issues');
@@ -97,19 +98,17 @@ test('frontend contract and responsive interactions',async t=>{
     await page.selectOption('[data-slot="0"]','issues');await page.reload();await page.waitForSelector('.project-card');assert.equal(await page.inputValue('[data-slot="0"]'),'issues');assert.equal(await page.inputValue('[data-slot="3"]'),'commits');
     await page.selectOption('[data-slot="0"]','commits');
   });
-  await t.test('cumulative defaults, mode switches all charts and persists without changing counts',async()=>{
-    assert.equal(await page.getAttribute('[data-chart-mode="cumulative"]','aria-pressed'),'true');
-    await page.click('[data-star-mode="gained"]');
+  await t.test('totals default, daily switches all charts and persists without changing counts',async()=>{
+    assert.equal(await page.getAttribute('[data-chart-mode="totals"]','aria-pressed'),'true');
     const row=page.locator('[data-project="one"] [data-metric="stars"]');
-    const initial=await row.locator('.chart-line').getAttribute('d');
-    assert.match(await row.locator('.spark-caption').textContent(),/Cumulative stars gained/);
+    assert.match(await row.locator('.spark-caption').textContent(),/Recorded balance/);
     const count=await row.locator('.spark-value').textContent();
-    const height=await page.locator('.aggregate-panel').first().evaluate(e=>e.getBoundingClientRect().height);assert.ok(height>=175&&height<=215,'top cards approximately 30% shorter');
-    await page.click('[data-chart-mode="daily"]');assert.match(await row.locator('.spark-caption').textContent(),/Daily stars gained/);assert.notEqual(await row.locator('.chart-line').getAttribute('d'),initial);assert.equal(await row.locator('.spark-value').textContent(),count);
+    const height=await page.locator('.aggregate-panel').first().evaluate(e=>e.getBoundingClientRect().height);assert.ok(height>=175&&height<=230,'top cards remain compact');
+    await page.click('[data-chart-mode="daily"]');assert.match(await row.locator('.spark-caption').textContent(),/Daily stars gained/);assert.equal(await row.locator('.chart-line').count(),1);assert.equal(await row.locator('.spark-value').textContent(),count);
     await page.reload();await page.waitForSelector('.project-card');assert.equal(await page.getAttribute('[data-chart-mode="daily"]','aria-pressed'),'true');
     await page.click('[data-project="one"] [data-metric="stars"]');await page.click('#full-history');assert.match(await page.locator('#detail .chart-explanation').first().textContent(),/Daily stars gained/);
-    await page.click('[data-chart-mode="cumulative"]');assert.match(await page.locator('#detail .chart-explanation').first().textContent(),/Cumulative stars gained/);assert.match(await page.locator('#detail').textContent(),/selected range/);await page.click('#back');
-    await page.reload();await page.waitForSelector('.project-card');assert.equal(await page.getAttribute('[data-chart-mode="cumulative"]','aria-pressed'),'true');
+    await page.click('[data-chart-mode="totals"]');assert.match(await page.locator('#detail .chart-explanation').first().textContent(),/Recorded balance/);assert.match(await page.locator('#detail').textContent(),/raw daily values/);await page.click('#back');
+    await page.reload();await page.waitForSelector('.project-card');assert.equal(await page.getAttribute('[data-chart-mode="totals"]','aria-pressed'),'true');
   });
   await t.test('recent activity is default and the selected sort persists',async()=>{
     const names=()=>page.locator('.project-name').allTextContents();
@@ -147,11 +146,12 @@ test('frontend contract and responsive interactions',async t=>{
     await page.click('#settings');assert.equal(await page.inputValue('#issue-danger'),'5');await page.fill('#issue-danger','1');await page.click('#preferences-form button[type="submit"]');assert.match(await page.locator('#preferences-message').textContent(),/higher/);
     await page.fill('#issue-warning','1');await page.fill('#issue-danger','3');await page.click('#preferences-form button[type="submit"]');await page.keyboard.press('Escape');
     await page.click('[data-project="two"] [data-metric="issues"]');await page.click('#full-history');assert.match(await page.locator('#detail .detail-chart-top strong').getAttribute('class'),/issue-danger/);await page.click('#back');
-    await page.click('[data-project="one"] [data-metric="stars"]');await page.click('#full-history');assert.match(await page.locator('#detail').textContent(),/Cumulative stars gained/);assert.equal(await page.locator('[data-detail-metric="star_activity"]').count(),0);await page.click('#back');
+    await page.click('[data-project="one"] [data-metric="stars"]');await page.click('#full-history');assert.match(await page.locator('#detail').textContent(),/Recorded balance/);assert.equal(await page.locator('[data-detail-metric="star_activity"]').count(),0);await page.click('#back');
   });
   await t.test('Stars details preserve graph failure and provenance separately from a healthy count',async()=>{
     const source=dashboard.repos.find(r=>r.id==='one').metrics.star_activity,original={...source};
     Object.assign(source,{status:'error',source:'Daily star history <untrusted>',coverage:{...source.coverage,complete:false}});
+    await page.click('[data-chart-mode="daily"]');
     await page.reload();await page.waitForSelector('.project-card');await page.click('[data-project="one"] [data-metric="stars"]');await page.click('#full-history');
     assert.match(await page.locator('#detail').textContent(),/Graph collection.*Latest graph collection failed/);
     assert.match(await page.locator('#detail').textContent(),/Graph source.*Daily star history <untrusted>/);
@@ -501,10 +501,10 @@ test('actionable drill-downs, accessibility, pagination and request isolation',a
       assert.equal(await page.locator('.contribution-table .metric-action').count(),4);await close();
     }
     await page.selectOption('[data-slot="0"]','commits');
-    await page.click('[data-star-mode="gained"]');
+    await page.click('[data-chart-mode="daily"]');
     await page.click('[data-aggregate="stars"] .aggregate-value');
-    assert.match(await page.locator('.cohort-note').textContent(),/3 of 4 count contributors/);
-    assert.match(await page.locator('.contribution-table').textContent(),/Count only/);
+    assert.match(await page.locator('.cohort-note').textContent(),/4 of 4 count contributors/);
+    assert.doesNotMatch(await page.locator('.contribution-table').textContent(),/Count only/);assert.equal(await page.locator('#dialog .chart-hit').count(),0,'a missing contributor leaves the entire graph unknown');
     await page.click('[data-contribution="atlas"]');await loaded();
     assert.match(await page.locator('#records-state').textContent(),/Daily observations only/);
     await page.click('#contribution-back');assert.equal(await page.locator('.contribution-table').isVisible(),true);await close();

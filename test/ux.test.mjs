@@ -54,6 +54,7 @@ async function ui(t,mode='proxy'){
     }
     if(url.pathname.startsWith('/api/')){
       if(control.expired)return send({error:'expired'},401);
+      if(url.pathname==='/api/notifications')return send({items:[],total:0,unreadCount:0,offset:0,limit:50,hasMore:false,snapshot:0,coverage:{complete:false,label:'Synthetic retained events'},status:'ready',updatedAt:null});
       if(url.pathname==='/api/dashboard')return send(dashboard);
       if(url.pathname==='/api/discover')return send({repositories:[]});
       throw Error('Unexpected API '+url.pathname);

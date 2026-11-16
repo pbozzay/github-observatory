@@ -30,8 +30,8 @@ test('retained collection warnings recognize disabled and access statuses withou
 const range=['2026-07-19','2026-07-20'];
 const retained=(id,value,observedAt,points=[])=>presentRepository({id,metrics:{stars:{label:'Stars',kind:'balance',unit:'stars',value,observedAt,points}}});
 test('empty gained aggregates summarize every contributor rather than borrowing the first reason',()=>{
-  const missing=presentRepository({id:'missing',metrics:{stars:{kind:'balance',value:7,points:[]}},metricAvailability:{star_activity:{state:'no_access'}}},'gained');
-  const old=presentRepository({id:'old',metrics:{stars:{kind:'balance',value:1433,points:[]},star_activity:{kind:'event',value:15,observedAt:'2026-06-20T12:00:00Z',points:[]}}},'gained');
+  const missing=presentRepository({id:'missing',metrics:{stars:{kind:'balance',value:7,points:[]}},metricAvailability:{star_activity:{state:'no_access'}}},'daily');
+  const old=presentRepository({id:'old',metrics:{stars:{kind:'balance',value:1433,points:[]},star_activity:{kind:'event',value:15,observedAt:'2026-06-20T12:00:00Z',points:[]}}},'daily');
   for(const repos of [[missing,old],[old,missing]]){
     const result=aggregate(repos,'stars',range);
     assert.match(result.chartUnavailableReason,/No observations in this range/);

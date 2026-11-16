@@ -1,6 +1,7 @@
 import { DatabaseSync, backup as sqliteBackup } from 'node:sqlite';
 import { mkdirSync, openSync, closeSync, lstatSync, unlinkSync, realpathSync, chmodSync, existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
+import { createHistory, migrateHistory, HISTORY_FLOOR } from './history.mjs';
 
 const DAY = 86_400_000;
 const MAX_BYTES = 8 * 1024 * 1024;
@@ -130,7 +131,7 @@ function normalizeRepository(value) {
   let names;
   try { names = repositoryName(`${value.owner?.login}/${value.name}`); } catch { throw safe('Invalid upstream metadata.', 502, 'invalid_response'); }
   if (typeof value.default_branch !== 'string' || !value.default_branch.length || value.default_branch.length > 255) throw safe('Invalid upstream metadata.', 502, 'invalid_response');
-  return { id: String(value.id), ...names, visibility: value.private ? 'private' : 'public', archived: value.archived, language: text(value.language, 100), description: text(value.description, 500), branch: value.default_branch, stars: value.stargazers_count, forks: value.forks_count, hasIssues: typeof value.has_issues === 'boolean' ? Number(value.has_issues) : null };
+  return { id: String(value.id), ...names, visibility: value.private ? 'private' : 'public', archived: value.archived, language: text(value.language, 100), description: text(value.description, 500), branch: value.default_branch, stars: value.stargazers_count, forks: value.forks_count, hasIssues: typeof value.has_issues === 'boolean' ? Number(value.has_issues) : null, createdDay: dateOf(value.created_at) };
 }
 function datesBetween(start, end) {
   const dates = [];
@@ -241,7 +242,7 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
     if (!db.prepare('PRAGMA table_info(repositories)').all().some(column => column.name === 'has_issues')) {
       db.exec('ALTER TABLE repositories ADD COLUMN has_issues INTEGER CHECK(has_issues IN (0,1));');
     }
-    db.exec('PRAGMA user_version=3;');
+    migrateHistory(db);
     // Include recovery in initialization cleanup: a failed UPDATE must not leak
     // either database handle or the lifetime writer lock.
     db.prepare("UPDATE runs SET status='interrupted', message='Collection interrupted; previous observations retained.' WHERE status='collecting'").run();
@@ -284,7 +285,7 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
   }
   async function request(endpoint, query, identity, context) {
     if (identity === 'token' && !token) throw safe('A token is required for this watch.', 401, 'credentials_missing');
-    if (!/^\/(?:repos\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:\/[a-z_/-]+)?|user\/repos)$/.test(endpoint)) throw safe('Invalid upstream route.', 500, 'invalid');
+    if (!/^\/(?:repos\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:\/[a-z_/-]+)?|user(?:\/repos)?)$/.test(endpoint)) throw safe('Invalid upstream route.', 500, 'invalid');
     const item = budget(identity);
     const time = clock().getTime();
     if (item.remaining <= 0 || item.blocked_until > time) throw safe('GitHub rate limit reached; waiting for reset.', 429, 'rate_limited');
@@ -321,6 +322,10 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
       if ((response.status < 200 || response.status >= 300) && response.status !== 409) {
         await response.body?.cancel().catch(() => {});
         const code = response.status === 404 ? 'unsupported' : response.status === 401 ? 'unauthorized' : response.status === 403 ? 'forbidden' : 'upstream_error';
+        if (response.status === 401 && identity === 'token') {
+          viewerVerifiedUntil = 0; viewerAttemptUntil = clock().getTime() + 5 * 60_000; viewerStatus = 'no_access';
+          db.prepare('DELETE FROM state WHERE key=?').run('notificationViewer');
+        }
         throw safe(code === 'unsupported' ? 'Endpoint unavailable or repository not accessible.' : code === 'unauthorized' ? 'GitHub credentials were rejected.' : code === 'forbidden' ? 'Endpoint permission unavailable.' : 'GitHub endpoint failed.', response.status === 401 ? 401 : 502, code);
       }
       const length = Number(response.headers.get('content-length') ?? 0);
@@ -356,39 +361,60 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
       if (!Array.isArray(response.data) || response.data.length > 100) throw safe('Invalid paginated GitHub response.', 502, 'invalid_response');
       items.push(...response.data);
       // Never follow provider-controlled URLs. Only increment our fixed-origin page number.
-      if (stop?.(response.data)) return { items, complete: true };
       const next = /\brel\s*=\s*["']?next\b/i.test(response.link);
       if (!next && response.data.length < 100) return { items, complete: true };
+      if (stop?.(response.data)) return { items, complete: true, stopped: true };
       // A full page without Link is ambiguous; request the next page rather than zero-filling.
       if (page === maxPages) return { items, complete: false };
     }
     return { items, complete: false };
   }
   function storeRepository(repo, access, alias, at, resume) {
+    const revisions = {};
     db.prepare(`INSERT INTO repositories(id,owner,name,visibility,archived,language,description,branch,access,has_issues) VALUES(?,?,?,?,?,?,?,?,?,?)
       ON CONFLICT(id) DO UPDATE SET owner=excluded.owner,name=excluded.name,visibility=excluded.visibility,archived=excluded.archived,
       language=excluded.language,description=excluded.description,branch=excluded.branch,access=excluded.access,
       has_issues=COALESCE(excluded.has_issues,repositories.has_issues),
       paused=CASE WHEN ? THEN 0 ELSE repositories.paused END`).run(repo.id, repo.owner, repo.name, repo.visibility, Number(repo.archived), repo.language, repo.description, repo.branch, access, repo.hasIssues, Number(resume));
+    if (repo.createdDay) db.prepare('UPDATE repositories SET created_day=? WHERE id=?').run(repo.createdDay, repo.id);
     for (const name of [alias, repo.full]) db.prepare('INSERT INTO aliases(alias,repo_id) VALUES(?,?) ON CONFLICT(alias) DO UPDATE SET repo_id=excluded.repo_id').run(name.toLowerCase(), repo.id);
     for (const metric of ['stars', 'forks']) {
-      if (nonnegative(repo[metric])) { putPoint(repo.id, metric, isoDay(at), repo[metric], at); run(repo.id, metric, 'ok', at, 'Observed repository balance.'); }
+      if (nonnegative(repo[metric])) {
+        putPoint(repo.id, metric, isoDay(at), repo[metric], at);
+        // Count transitions have a durable identity, including same-day ABA.
+        // Equal observations do not invalidate a resumable long traversal.
+        revisions[metric] = db.prepare(`INSERT INTO cohort_observations(repo_id,metric,value,revision) VALUES(?,?,?,1)
+          ON CONFLICT(repo_id,metric) DO UPDATE SET value=excluded.value,
+          revision=cohort_observations.revision + (cohort_observations.value IS NOT excluded.value)
+          RETURNING revision`).get(repo.id, metric, repo[metric]).revision;
+        // Withdraw published reconstruction in the observation transaction.
+        // Unfinished jobs retain their cursor and original anchor revision;
+        // their eventual completion must pass the same freshness guard.
+        db.prepare(`UPDATE history_jobs SET coherent=0,checked_at=NULL,
+          status=CASE WHEN status='complete' THEN 'limited' ELSE status END
+          WHERE repo_id=? AND metric=? AND coherent=1 AND anchor_revision IS NOT ?`).run(repo.id, metric, revisions[metric]);
+        run(repo.id, metric, 'ok', at, 'Observed repository balance.');
+      }
       else run(repo.id, metric, 'invalid_response', at, 'Repository balance unavailable; previous observations retained.');
     }
     run(repo.id, 'metadata', 'ok', at, 'Repository metadata collected.');
+    return revisions;
   }
   function dateWindow(range) {
     const selection = String(range);
     if (!['7', '30', '90', 'all'].includes(selection)) throw safe('Invalid range.');
     const end = isoDay(clock());
-    const lower = isoDay(Date.parse(`${end}T00:00:00Z`) - 3659 * DAY);
-    const first = db.prepare('SELECT MIN(day) AS day FROM points WHERE day<=?').get(end).day;
+    const lower = HISTORY_FLOOR;
+    const first = db.prepare(`SELECT MIN(day) AS day FROM (
+      SELECT day FROM points WHERE day<=? UNION ALL SELECT b.day FROM history_buckets b
+      JOIN history_jobs j ON j.repo_id=b.repo_id AND j.metric=b.metric AND j.generation=b.generation WHERE b.day<=?
+    )`).get(end, end).day;
     const start = selection === 'all' ? (first && first > lower ? first : first ? lower : end) : isoDay(Date.parse(`${end}T00:00:00Z`) - (Number(selection) - 1) * DAY);
-    return { start, end };
+    return { start, end, rangeLimit: { earliest: lower, truncated: selection === 'all' && Boolean(first && first < lower) } };
   }
   function dashboard(range = '30') {
     ensureOpen();
-    const { start, end } = dateWindow(range);
+    const { start, end, rangeLimit } = dateWindow(range);
     const dates = datesBetween(start, end);
     const repos = db.prepare('SELECT * FROM repositories WHERE paused=0 ORDER BY lower(owner),lower(name)').all().map(row => {
       const metrics = {}, availability = {};
@@ -404,12 +430,13 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
         const complete = observations.length === dates.length && outcome?.status === 'ok';
         const value=kind==='balance'?latest.value:observations.length?observations.reduce((sum,point)=>sum+point.value,0):null;
         metrics[key] = { label, kind, unit, value, observedAt:latest.observed_at, delta: kind === 'balance' && complete && dates.length > 1 ? points.at(-1).value - points[0].value : null, points,
-          coverage: { start: observations[0]?.day ?? null, end: observations.at(-1)?.day ?? null, complete }, status: row.paused ? 'paused' : outcome?.status ?? 'not_collected', lastSuccess: outcome?.last_success ?? null, source };
+          coverage: { start: observations[0]?.day ?? null, end: observations.at(-1)?.day ?? null, complete }, status: row.paused ? 'paused' : outcome?.status ?? 'not_collected', lastSuccess: outcome?.last_success ?? null, source,
+          history: history.project(row.id, key, kind, dates, outcome) };
       }
       const lastActivityAt = db.prepare('SELECT MAX(occurred_at) AS at FROM activity_records WHERE repo_id=? AND occurred_at<=?').get(row.id, clock().toISOString()).at;
       return { ...publicRepo(row), metrics, metricAvailability: availability, ...(lastActivityAt ? { lastActivityAt } : {}) };
     });
-    return { dates, repos, updatedAt: getState('updatedAt'), collecting: Boolean(flight), credentialConfigured: Boolean(token) };
+    return { dates, repos, updatedAt: getState('updatedAt'), collecting: Boolean(flight), credentialConfigured: Boolean(token), rangeLimit };
   }
   function status() {
     ensureOpen();
@@ -522,6 +549,39 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
       return { repositories: [...unique.values()], complete: result.complete, status: result.complete ? 'ok' : 'partial', ...(!result.complete ? { message: 'Repository discovery reached the pagination limit.' } : {}) };
     } catch (error) { return { repositories: [], complete: false, status: error.code || 'error', message: error.safeMessage || 'Repository discovery failed.' }; }
   });
+  // Background notification refresh only. Not called by any GET or startup.
+  // Persist only the verified login; verify afresh in every process (including
+  // after a credential change), then expire that verification after one hour.
+  let viewerVerifiedUntil = 0, viewerAttemptUntil = 0, viewerStatus = 'error', viewerFlight = null;
+  const notificationContext = () => tracked(async () => {
+    const unavailable = status => ({ viewer: null, repositories: [], coverage: { complete: false, label: 'Notification coverage unavailable; authenticated identity is not verified.' }, status });
+    if (!token) return unavailable('not_configured');
+    const time = clock().getTime();
+    if (time >= viewerVerifiedUntil) {
+      if (time < viewerAttemptUntil) return unavailable(viewerStatus);
+      if (!viewerFlight) viewerFlight = (async () => {
+        try {
+          const response = await request('/user', {}, 'token', {});
+          const login = response.data?.login;
+          if (typeof login !== 'string' || !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/.test(login)) throw safe('Invalid authenticated identity.', 502, 'invalid_response');
+          setState('notificationViewer', login);
+          viewerVerifiedUntil = clock().getTime() + 60 * 60_000;
+          viewerAttemptUntil = 0;
+          viewerStatus = 'ready';
+        } catch (error) {
+          viewerVerifiedUntil = 0;
+          viewerAttemptUntil = clock().getTime() + 5 * 60_000;
+          viewerStatus = ['forbidden', 'unauthorized', 'credentials_missing'].includes(error.code) ? 'no_access' : 'error';
+          db.prepare('DELETE FROM state WHERE key=?').run('notificationViewer');
+        }
+      })().finally(() => { viewerFlight = null; });
+      await viewerFlight;
+    }
+    if (viewerStatus !== 'ready' || clock().getTime() >= viewerVerifiedUntil) return unavailable(viewerStatus === 'ready' ? 'error' : viewerStatus);
+    const viewer = getState('notificationViewer');
+    const repositories = db.prepare('SELECT id,owner,name FROM repositories WHERE paused=0 AND lower(owner)=lower(?) ORDER BY id').all(viewer);
+    return { viewer, repositories, coverage: { complete: false, label: 'Retained activity for verified owned watches only; provider event limits and collection gaps apply.' }, status: 'ready' };
+  });
   function incomplete(result) { if (!result.complete) throw safe('Pagination limit reached; previous observations retained.', 502, 'partial'); return result.items; }
   function endpointFailure(id, metric, error, at) { run(id, metric, error.code || 'error', at, error.safeMessage || 'Collection failed; previous observations retained.'); }
   function storeEvent(id, metric, value, at) {
@@ -542,6 +602,7 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
       run(id, metric, 'ok', at, 'Complete bounded event coverage collected.'); setState('updatedAt', at);
     });
   }
+  const history = createHistory({ db, transaction, request, maxPages, safe, dateOf, isoDay, datesBetween, putPoint, storeEvent, run, setState });
   function feedEvent(item, row, web) {
     const date = timestamp(item?.created_at);
     if (!date || typeof item.id !== 'string' || !/^\d{1,40}$/.test(item.id) || typeof item.type !== 'string' || !/^[A-Z][A-Za-z]{0,60}Event$/.test(item.type) || (item.repo?.id !== undefined && String(item.repo.id) !== row.id)) throw safe('Invalid activity event.', 502, 'invalid_response');
@@ -609,6 +670,25 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
         if (typeof p.comment?.commit_id === 'string' && /^[a-fA-F0-9]{1,64}$/.test(p.comment.commit_id)) { metadata.sha = p.comment.commit_id; url = `${web}/commit/${p.comment.commit_id}`; }
         break;
     }
+    if (['IssueCommentEvent', 'PullRequestReviewCommentEvent', 'DiscussionCommentEvent'].includes(item.type)) {
+      if (nonnegative(p.comment?.id) && p.comment.id > 0) {
+        metadata.commentId = p.comment.id;
+        const section = item.type === 'DiscussionCommentEvent' ? 'discussions' : item.type === 'PullRequestReviewCommentEvent' || p.issue?.pull_request ? 'pull' : 'issues';
+        const fragment = item.type === 'DiscussionCommentEvent' ? 'discussioncomment-' : item.type === 'PullRequestReviewCommentEvent' ? 'discussion_r' : 'issuecomment-';
+        const expected = number(metadata.number) ? `${web}/${section}/${metadata.number}#${fragment}${p.comment.id}` : null;
+        // Only a matching, specific GitHub URL can replace the generic subject URL.
+        if (expected && p.comment.html_url === expected) url = expected;
+      }
+      if (typeof p.comment?.body === 'string') {
+        const proseOnly = withoutFences(p.comment.body.slice(0, 32_000)).split('\n').filter(line => !/^(?: {4}|\t)/.test(line) && !codeStatement(line)).join('\n').replace(/`+[^`]*`+/g, ' ');
+        const mentions = new Set();
+        for (const match of proseOnly.matchAll(/(?:^|[^A-Za-z0-9_@])@([A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?)(?![A-Za-z0-9_-])/g)) {
+          mentions.add(match[1].toLowerCase());
+          if (mentions.size === 20) break;
+        }
+        if (mentions.size) metadata.mentions = [...mentions];
+      }
+    }
     return { id, type, day: date.slice(0, 10), title: title.slice(0, 200) || 'Repository activity', url, author: actor?.login ?? actor?.name ?? null, date, actor, summary, metadata };
   }
   async function collectFeed(row, route, web, context, at) {
@@ -655,12 +735,12 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
   async function collect(row, context, at) {
     const start = isoDay(Date.parse(`${isoDay(at)}T00:00:00Z`) - 179 * DAY);
     const end = isoDay(at);
-    let repo;
+    let repo, cohortRevisions;
     run(row.id, 'metadata', 'collecting', at, 'Collecting repository metadata.');
     try {
       repo = normalizeRepository((await request(`/repos/${row.owner}/${row.name}`, {}, row.access, context)).data);
       if (repo.id !== row.id || (row.access === 'public' && repo.visibility !== 'public')) throw safe('Repository identity or access changed.', 403, 'identity_changed');
-      transaction(() => { storeRepository(repo, row.access, `${row.owner}/${row.name}`, at, false); setState('updatedAt', at); });
+      transaction(() => { cohortRevisions = storeRepository(repo, row.access, `${row.owner}/${row.name}`, at, false); setState('updatedAt', at); });
     } catch (error) {
       transaction(() => { for (const metric of ['metadata', 'activity', ...Object.keys(DEFINITIONS)]) endpointFailure(row.id, metric, error, at); });
       return false;
@@ -670,18 +750,13 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
     let successful = nonnegative(repo.stars) && nonnegative(repo.forks);
     const jobs=[];
     const perform=(metric,action)=>{jobs.push({metric,action});};
-    await perform('commits', async () => {
-      const items = incomplete(await pages(`${route}/commits`, { sha: repo.branch, since: `${start}T00:00:00Z`, until: at }, row.access, context));
-      const values = items.map(item => {
+    const normalizeCommits = items => items.map(item => {
         const day = dateOf(item.commit?.committer?.date);
         if (!day || typeof item.sha !== 'string' || !/^[a-fA-F0-9]{1,64}$/.test(item.sha)) throw safe('Invalid commit response.', 502, 'invalid_response');
         const [title, ...rest] = typeof item.commit?.message === 'string' ? item.commit.message.split(/\r?\n/) : [];
         return { id: item.sha.toLowerCase(), day, title: oneLine(title) || 'Commit (title unavailable)', url: `${web}/commit/${item.sha.toLowerCase()}`, ...descriptive(item.author, item.commit?.author?.name, rest.join('\n'), { sha: item.sha.toLowerCase(), branch: refName(repo.branch) }, item.commit.committer.date, 'commits') };
-      });
-      putEvents(row.id, 'commits', values, start, end, at);
     });
-    await perform('merged_prs', async () => {
-      const items = incomplete(await pages(`${route}/pulls`, { state: 'closed', sort: 'updated', direction: 'desc' }, row.access, context, page => page.length > 0 && page.every(item => dateOf(item.updated_at)) && page.at(-1).updated_at < `${start}T00:00:00Z`));
+    const normalizePulls = items => {
       const values = [];
       for (const item of items) {
         if (!Object.hasOwn(item, 'merged_at')) throw safe('Invalid pull request response.', 502, 'invalid_response');
@@ -690,10 +765,9 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
         if (!day || !nonnegative(item.number) || item.number < 1) throw safe('Invalid pull request response.', 502, 'invalid_response');
         values.push({ id: String(item.number), day, title: oneLine(item.title) || `Pull request #${item.number}`, url: `${web}/pull/${item.number}`, ...descriptive(item.user, undefined, item.body, { number: item.number, action: 'merged', ...(refName(item.head?.ref) ? { head: item.head.ref } : {}), ...(refName(item.base?.ref) ? { base: item.base.ref } : {}) }, item.merged_at, 'pulls') });
       }
-      putEvents(row.id, 'merged_prs', values, start, end, at);
-    });
-    await perform('releases', async () => {
-      const items = incomplete(await pages(`${route}/releases`, {}, row.access, context));
+      return values;
+    };
+    const normalizeReleases = items => {
       const values = [];
       for (const item of items) {
         if (item.draft === true) continue;
@@ -703,7 +777,36 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
         const url = ref ? `${web}/releases/tag/${encodeURIComponent(ref)}` : `${web}/releases`;
         values.push({ id: String(item.id), day, title: oneLine(item.name) || ref?.slice(0, 200) || 'Release', url, ...descriptive(item.author, undefined, item.body, { ref, refType: 'tag', action: 'published' }, item.published_at, 'releases') });
       }
-      putEvents(row.id, 'releases', values, start, end, at);
+      return values;
+    };
+    await perform('commits', async () => {
+      const items = incomplete(await pages(`${route}/commits`, { sha: repo.branch, since: `${start}T00:00:00Z`, until: at }, row.access, context));
+      putEvents(row.id, 'commits', normalizeCommits(items), start, end, at);
+    });
+    await perform('merged_prs', async () => {
+      const items = incomplete(await pages(`${route}/pulls`, { state: 'closed', sort: 'updated', direction: 'desc' }, row.access, context, page => page.length > 0 && page.every(item => dateOf(item.updated_at)) && page.at(-1).updated_at < `${start}T00:00:00Z`));
+      putEvents(row.id, 'merged_prs', normalizePulls(items), start, end, at);
+    });
+    await perform('releases', async () => {
+      const backfilled = db.prepare("SELECT exhausted FROM history_jobs WHERE repo_id=? AND metric='releases'").get(row.id)?.exhausted;
+      const result = await pages(`${route}/releases`, {}, row.access, context, page => Boolean(backfilled && page.some(item => dateOf(item.published_at) < start && db.prepare('SELECT 1 FROM events WHERE id=?').get(`${row.id}:releases:${item.id}`))));
+      const values = normalizeReleases(incomplete(result));
+      if (!result.stopped) putEvents(row.id, 'releases', values, start, end, at);
+      else transaction(() => {
+        // The release API has no since filter and publication order need not
+        // match creation order. Stop at retained old releases, but do not claim
+        // full coverage or erase unseen records on this incremental refresh.
+        for (const value of values) {
+          if (value.day > end) continue;
+          // Like backfill, an old page may add metadata-only records, but must
+          // not replace richer context retained when a release was recent.
+          if (value.day < start && db.prepare('SELECT 1 FROM events WHERE id=?').get(`${row.id}:releases:${value.id}`)) continue;
+          storeEvent(row.id, 'releases', value.day < start ? { ...value, summary: undefined } : value, at);
+        }
+        for (const p of db.prepare("SELECT day,COUNT(*) AS value FROM events WHERE repo_id=? AND type='releases' AND day>=? AND day<=? GROUP BY day").all(row.id, start, end)) putPoint(row.id, 'releases', p.day, p.value, at);
+        run(row.id, 'releases', 'partial', at, 'Recent release pages refreshed; retained older releases not rescanned.');
+        setState('updatedAt', at);
+      });
     });
     await perform('issues', async () => {
       if (db.prepare('SELECT has_issues FROM repositories WHERE id=?').get(row.id).has_issues === 0) {
@@ -737,35 +840,12 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
         setState('updatedAt', at);
       });
     });
-    for (const metric of ['views', 'clones', 'star_activity']) await perform(metric, async () => {
-      const endpoint = metric === 'star_activity' ? `${route}/stargazers/history` : `${route}/traffic/${metric}`;
-      const response = await request(endpoint, metric === 'star_activity' ? {per_page:30,page:1} : {per:'day'}, row.access, context);
-      let data=response.data;
-      // GitHub returns newest-first weekly buckets of seven daily creation counts.
-      // Preserve provider boundaries; these are activity, NOT historical star balances.
-      let items;
-      if(metric==='star_activity'&&Array.isArray(data)&&data.length&&Object.hasOwn(data[0],'week')){
-        const daily=[];let complete=false;
-        for(let page=1;page<=maxPages;page++){
-          if(!Array.isArray(data)||data.length>30)throw safe('Invalid star-history page.',502,'invalid_response');
-          let oldest=null;
-          for(const bucket of data){
-            if(!nonnegative(bucket.week)||bucket.week>253402300799||!Array.isArray(bucket.days)||bucket.days.length!==7||!bucket.days.every(nonnegative))throw safe('Invalid star-history bucket.',502,'invalid_response');
-            const first=isoDay(bucket.week*1000);oldest=oldest===null||first<oldest?first:oldest;
-            bucket.days.forEach((count,index)=>daily.push({date:isoDay(bucket.week*1000+index*DAY),count}));
-          }
-          if(data.length<30||oldest<=start){complete=true;break;}
-          if(page<maxPages)data=(await request(endpoint,{per_page:30,page:page+1},row.access,context)).data;
-        }
-        if(!complete)throw safe('Star history reached pagination limit; previous observations retained.',502,'partial');
-        items=daily;
-      }else{
-        // Also accept explicitly dated provider buckets; unknown formats stay unknown.
-        items=metric==='star_activity'?(Array.isArray(data)?data:data?.stars??data?.history??data?.stargazers):data?.[metric];
-      }
+    for (const metric of ['views', 'clones']) await perform(metric, async () => {
+      const response = await request(`${route}/traffic/${metric}`, { per: 'day' }, row.access, context);
+      const items = response.data?.[metric];
       if (!Array.isArray(items) || items.length > 3660) throw safe('Unsupported aggregate response format.', 502, 'invalid_response');
       const points = new Map();
-      const lower = metric === 'star_activity' ? start : isoDay(Date.parse(`${end}T00:00:00Z`) - 14 * DAY);
+      const lower = isoDay(Date.parse(`${end}T00:00:00Z`) - 14 * DAY);
       for (const item of items) {
         const day = dateOf(item.timestamp ?? item.date);
         if (!day || !nonnegative(item.count) || points.has(day)) throw safe('Invalid aggregate response.', 502, 'invalid_response');
@@ -776,13 +856,33 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
         run(row.id, metric, 'ok', at, 'Provider daily buckets observed; omitted days remain unknown.'); setState('updatedAt', at);
       });
     });
+    const cohort = metric => history.collectCohort({ row, metric, endpoint: `${route}/${metric === 'stars' ? 'stargazers/history' : 'forks'}`, at, context, anchor: repo[metric], anchorRevision: cohortRevisions[metric] ?? null, verifyAnchor: async () => {
+      const check = normalizeRepository((await request(route, {}, row.access, context)).data);
+      if (check.id !== row.id || row.access === 'public' && check.visibility !== 'public') throw safe('Repository identity or access changed.', 403, 'identity_changed');
+      return check[metric];
+    } });
+    perform('star_activity', () => cohort('stars'));
     perform('activity', () => collectFeed(row, route, web, context, at));
+    perform('history_forks', () => cohort('forks'));
+    for (const [metric, endpoint, normalize, query, branch] of [
+      ['commits', 'commits', normalizeCommits, job => ({ sha: repo.branch, until: job.started_at }), repo.branch],
+      ['merged_prs', 'pulls', normalizePulls, () => ({ state: 'all', sort: 'created', direction: 'asc' })],
+      ['releases', 'releases', normalizeReleases, () => ({})],
+    ]) perform(`history_${metric}`, () => history.collectEvents({ row, metric, endpoint: `${route}/${endpoint}`, query, normalize, at, context, branch }));
     const cursor=getState('familyCursor:'+row.id),pivot=Math.max(0,jobs.findIndex(job=>job.metric===cursor));
     const ordered=[...jobs.slice(pivot),...jobs.slice(0,pivot)];let deferred=null;
     for(const {metric,action} of ordered){
       if(db.prepare('SELECT paused FROM repositories WHERE id=?').get(row.id)?.paused)break;
       run(row.id,metric,'collecting',at,'Collecting endpoint.');
-      try{await action();}catch(error){successful=false;endpointFailure(row.id,metric,error,at);if(['budget_exhausted','rate_limited'].includes(error.code)&&deferred===null)deferred=metric;}
+      const beforeRequests = context[row.access] ?? 0;
+      try{await action();}catch(error){
+        successful=false;endpointFailure(row.id,metric,error,at);
+        if(['budget_exhausted','rate_limited'].includes(error.code)&&deferred===null) {
+          // A large family that consumes the whole identity budget must yield
+          // to its siblings next cycle, not pin the cursor to itself forever.
+          deferred = (context[row.access] ?? 0) > beforeRequests ? ordered[(ordered.findIndex(job => job.metric === metric) + 1) % ordered.length].metric : metric;
+        }
+      }
     }
     if(deferred)setState('familyCursor:'+row.id,deferred);
     else db.prepare('DELETE FROM state WHERE key=?').run('familyCursor:'+row.id);
@@ -853,5 +953,5 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
     if (iso !== null && (typeof iso !== 'string' || !Number.isFinite(Date.parse(iso)))) throw safe('Invalid schedule.');
     nextRun = iso === null ? null : new Date(iso).toISOString();
   }
-  return { dashboard, status, events, activity, details, discover, addWatch, sync, pauseWatch, backup, close, setNextRun };
+  return { dashboard, status, events, activity, details, discover, addWatch, sync, pauseWatch, backup, close, setNextRun, notificationContext };
 }
