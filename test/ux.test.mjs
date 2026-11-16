@@ -139,6 +139,12 @@ test('repository rows repeat metric labels by default and persist the optional s
   for(const label of await labels.all())assert.equal(await label.isVisible(),true);
   assert.equal(await page.locator('#cards [data-unwatch]').count(),0);
   const status=page.locator('.project-name-row .visibility-icon');
+  for(const width of [1440,390]){
+    await page.setViewportSize({width,height:900});
+    const geometry=await status.evaluate(icon=>{const a=icon.getBoundingClientRect(),b=icon.previousElementSibling.getBoundingClientRect();return {width:a.width,height:a.height,gap:a.left-b.right,centerOffset:Math.abs((a.top+a.bottom-b.top-b.bottom)/2)};});
+    assert.equal(geometry.width,12);assert.equal(geometry.height,12);assert.equal(geometry.gap,4);assert.ok(geometry.centerOffset<=1);
+  }
+  await page.setViewportSize({width:1440,height:1000});
   assert.equal(await status.getAttribute('aria-label'),'Private repository');assert.equal(await status.getAttribute('title'),'Private repository');
   assert.equal(await status.locator('.eye-slash').count(),1);assert.equal(await page.locator('#cards .badge.private').count(),0);
   await page.click('#settings');assert.equal(await page.isChecked('#show-graph-labels'),true);assert.equal(await page.locator('#watched-repositories [data-unwatch]').count(),1);
