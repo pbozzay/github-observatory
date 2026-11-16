@@ -8,6 +8,19 @@ export const collectionProblem=status=>/^(error|failed|failure|rate_limited|rate
 function combinedStatus(values){const states=values.filter(Boolean);return states.find(collectionProblem)||states.find(s=>s==='collecting')||states[0]||null;}
 export const CARD_METRICS=Object.freeze({commits:'Commits',stars:'Stars',views:'Views',issues:'Open issues',forks:'Forks',merged_prs:'Merged PRs',releases:'Releases',clones:'Clones'});
 export const DEFAULT_CHART_KEYS=Object.freeze(['commits','stars','views','issues']);
+export function validateRowKeys(value){
+  return Array.isArray(value)&&value.every(key=>typeof key==='string'&&Object.hasOwn(CARD_METRICS,key))&&new Set(value).size===value.length?[...value]:null;
+}
+// Activity means an observed event, not a current balance or collection time.
+export function repositoryActivity(repo){
+  const persisted=Date.parse(repo.lastActivityAt);
+  if(Object.hasOwn(repo,'lastActivityAt'))return Number.isFinite(persisted)?persisted:0;
+  const dates=Object.entries(repo.metrics||{}).filter(([key,m])=>['commits','merged_prs','releases','star_activity','stars','forks'].includes(key)&&(m.chartKind||m.kind)==='event').flatMap(([,m])=>(m.points||[]).filter(p=>finite(p.value)&&p.value>0).map(p=>Date.parse(p.date))).filter(Number.isFinite);
+  return dates.length?Math.max(...dates):0;
+}
+export function compareRepositories(a,b,sort='activity'){
+  return (sort==='activity'?repositoryActivity(b)-repositoryActivity(a):0)||String(a.name).localeCompare(String(b.name))||String(a.owner).localeCompare(String(b.owner))||String(a.id).localeCompare(String(b.id));
+}
 export function validateChartKeys(value){
   return Array.isArray(value)&&value.length===4&&value.every(key=>typeof key==='string'&&Object.hasOwn(CARD_METRICS,key))&&new Set(value).size===4?[...value]:null;
 }

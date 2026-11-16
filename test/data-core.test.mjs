@@ -20,7 +20,8 @@ function mockGitHub(overrides = {}) {
     if (value instanceof Response) return value;
     if (value === undefined) {
       if (key === '/user/repos') value = [metadata()];
-      else if (key.endsWith('/commits')) value = [{ sha: 'abc123', commit: { committer: { date: '2026-06-19T03:00:00Z', email: 'never-store@example.invalid' }, message: 'Do not store commit message' }, author: { login: 'contributor' } }];
+      else if (key.endsWith('/commits')) value = [{ sha: 'abc123', commit: { committer: { date: '2026-06-19T03:00:00Z', email: 'never-store@example.invalid' }, message: 'Actual commit title\n\nBounded descriptive context' }, author: { login: 'contributor' } }];
+      else if (key.endsWith('/events')) value = [];
       else if (key.endsWith('/pulls')) value = [{ number: 12, merged_at: '2026-06-18T05:00:00Z', updated_at: '2026-06-18T05:00:00Z', title: 'Merged change', user: { login: 'contributor' } }, { number: 13, merged_at: null, updated_at: '2026-06-18T05:00:00Z' }];
       else if (key.endsWith('/releases')) value = [{ id: 42, published_at: '2026-06-17T03:00:00Z', name: 'v1', tag_name: 'v1', draft: false }];
       else if (key.endsWith('/issues')) value = [{ id: 1, number: 1 }, { id: 2, number: 2, pull_request: {} }];
@@ -82,7 +83,9 @@ test('token watches collect actual observations and complete bounded events', as
   db.close();
   assert.ok(!dump.includes('never-store'));
   assert.ok(!dump.includes('synthetic-test-token'));
-  assert.ok(!dump.includes('Do not store commit message'));
+  // User-authorized descriptive metadata supersedes the old no-message rule;
+  // source code, raw bodies, credentials and emails remain forbidden.
+  assert.ok(dump.includes('Actual commit title'));
 });
 
 test('public watches stay anonymous even with a configured token', async t => {
@@ -209,7 +212,7 @@ test('single flight, idempotent repeated sync, default branch bounds, and pause'
   assert.equal(calls.length, count);
   assert.equal(service.dashboard('7').repos.length, 0);
   assert.equal(service.status().runs.find(r=>r.metric==='commits').status, 'paused');
-  assert.equal(service.events().events.length, 3);
+  assert.equal(service.events().events.length, 0);
 });
 
 test('traffic overlaps upsert rather than add and missing days stay null', async t => {
@@ -540,4 +543,6 @@ test('bounded public collection rotates deferred repositories across hourly rese
  for(let i=1;i<=8;i++)await service.addWatch({repository:'example/project'+i,access:'public'});
  for(let hour=1;hour<=3;hour++){current=new Date(Date.parse(NOW)+hour*3600000);await service.sync();}
  assert.ok(service.dashboard('7').repos.every(r=>r.metrics.commits?.lastSuccess));
+ assert.ok(service.status().runs.filter(r=>r.metric==='activity').every(r=>r.lastSuccess));
+ assert.equal(service.status().runs.filter(r=>r.metric==='activity').length,8);
 });

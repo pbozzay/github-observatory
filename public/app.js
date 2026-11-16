@@ -1,18 +1,21 @@
-import {finite, escapeHTML as e, fmt, keys, githubURL, githubMetricAction, aligned, aggregate, chart, chartView, exportCSV, presentRepository, issueLevel, validateThresholds, validateChartKeys, CARD_METRICS, DEFAULT_CHART_KEYS, collectionProblem as errorStatus} from './metrics.js';
+import {finite, escapeHTML as e, fmt, keys, githubURL, githubMetricAction, aligned, aggregate, chart, chartView, exportCSV, presentRepository, issueLevel, validateThresholds, validateChartKeys, CARD_METRICS, DEFAULT_CHART_KEYS, compareRepositories, validateRowKeys, collectionProblem as errorStatus} from './metrics.js';
 const $ = s => document.querySelector(s), $$ = s => [...document.querySelectorAll(s)];
 let unlockKey = new URLSearchParams(location.hash.slice(1)).get('unlock');
 if(location.hash) history.replaceState(null,'',location.pathname+location.search);
 const query=new URLSearchParams(location.search);
-const state={range:['7','30','90','all'].includes(query.get('range'))?query.get('range'):'30',visibility:['public','private'].includes(query.get('visibility'))?query.get('visibility'):'all',data:null,csrf:null,page:'overview',detail:null,chartKeys:[...DEFAULT_CHART_KEYS],sort:'name',request:0};
+const state={range:['7','30','90','all'].includes(query.get('range'))?query.get('range'):'30',visibility:['public','private'].includes(query.get('visibility'))?query.get('visibility'):'all',data:null,csrf:null,page:'overview',detail:null,chartKeys:[...DEFAULT_CHART_KEYS],sort:'activity',rowKeys:null,request:0};
 const preferencesKey='github-observatory-preferences',chartModeKey='github-observatory-chart-mode';
 state.graphMode='cumulative';
 try{if(localStorage.getItem(chartModeKey)==='daily')state.graphMode='daily';}catch{}
 state.issueThresholds={warning:1,danger:3};
-try{const saved=JSON.parse(localStorage.getItem(preferencesKey));state.issueThresholds=validateThresholds(saved)||state.issueThresholds;state.chartKeys=validateChartKeys(saved?.chartKeys)||state.chartKeys;}catch{}
-function savePreferences(){try{localStorage.setItem(preferencesKey,JSON.stringify({...state.issueThresholds,chartKeys:state.chartKeys}));return true;}catch{return false;}}
+try{const saved=JSON.parse(localStorage.getItem(preferencesKey));state.issueThresholds=validateThresholds(saved)||state.issueThresholds;state.chartKeys=validateChartKeys(saved?.chartKeys)||state.chartKeys;state.rowKeys=validateRowKeys(saved?.rowKeys);if(['name','activity'].includes(saved?.sort))state.sort=saved.sort;}catch{}
+function savePreferences(){try{localStorage.setItem(preferencesKey,JSON.stringify({...state.issueThresholds,chartKeys:state.chartKeys,rowKeys:state.rowKeys,sort:state.sort}));return true;}catch{return false;}}
 const issueClass=(key,m)=>key==='issues'&&issueLevel(m.value,state.issueThresholds)?'issue-'+issueLevel(m.value,state.issueThresholds):'';
 const issueHint=(key,m)=>issueClass(key,m)?issueLevel(m.value,state.issueThresholds)+' threshold exceeded':'';
-let toastTimer, dialogFocus, detailFocus, drilldown;
+let toastTimer, dialogFocus, detailFocus, drilldown, activity, statusRequest=0, dialogSession=0;
+// DOM IDs are reused; only the session that started work may update dialog UI.
+const dialogActive=session=>()=>session===dialogSession&&$('#dialog').open&&!!state.csrf;
+function cancelActivity(){activity?.controller.abort();activity=null;$('#activity').setAttribute('aria-busy','false');}
 function cancelDrilldown(){drilldown?.controller?.abort();drilldown=null;}
 const rangeLabel=()=>(state.dataRange || state.range)==='all'?'all stored history':`last ${state.dataRange || state.range} days`;
 const dateText=value=>/^\d{4}-\d{2}-\d{2}$/.test(value)?value:value && !Number.isNaN(Date.parse(value))?new Date(value).toLocaleString():'Not yet collected';
@@ -20,7 +23,7 @@ function persist(){const q=new URLSearchParams({range:state.range,visibility:sta
 persist(); // Never persist repository search terms or identifiers.
 $('#scope-filter').value=state.visibility;
 function notify(message){$('#toast').textContent=message;$('#toast').hidden=false;clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('#toast').hidden=true,4500);}
-function locked(){cancelDrilldown();state.csrf=null;state.data=null;state.detail=null;state.request++;$('#workspace').hidden=true;$('#settings').hidden=true;$('#locked').hidden=false;['#aggregate','#cards','#detail','#events','#collection-content','#dialog-body'].forEach(s=>$(s).replaceChildren());$('#search').value='';$('#scope-summary').textContent='';$('#projects-summary').textContent='';$('#freshness').textContent='';$('#dialog-title').textContent='';$('#dialog').close();}
+function locked(){cancelDrilldown();cancelActivity();statusRequest++;$('#events-state').textContent='';$('#events-more').hidden=true;clearTimeout(toastTimer);$('#toast').hidden=true;$('#toast').textContent='';state.csrf=null;state.data=null;state.detail=null;state.request++;$('#workspace').hidden=true;$('#settings').hidden=true;$('#locked').hidden=false;['#aggregate','#cards','#detail','#events','#collection-content','#dialog-body'].forEach(s=>$(s).replaceChildren());$('#search').value='';$('#scope-summary').textContent='';$('#projects-summary').textContent='';$('#freshness').textContent='';$('#dialog-title').textContent='';$('#dialog').close();}
 async function api(path,{method='GET',body,session=false,signal}={}){
   const headers={Accept:'application/json'};
   if(method!=='GET'){headers['Content-Type']='application/json';if(!session)headers['X-CSRF-Token']=state.csrf || '';}
@@ -48,12 +51,14 @@ function renderAggregates(repos){
   $$('.aggregate-panel').forEach(panel=>panel.onclick=event=>{if(!event.target.closest('button,select,option,a')){panel.querySelector('.aggregate-value').focus();openAggregateDialog(map.get(panel.dataset.aggregate),panel.dataset.aggregate,repos.length);}});
 }
 function renderCards(repos){
-  const columns=[...new Set(repos.flatMap(keys))],labels=new Map(repos.flatMap(r=>keys(r).map(k=>[k,r.metrics[k].label])));
-  const sorted=[...repos].sort((a,b)=>state.sort==='name'?a.name.localeCompare(b.name):(finite(b.metrics?.commits?.value)?b.metrics.commits.value:-Infinity)-(finite(a.metrics?.commits?.value)?a.metrics.commits.value:-Infinity)||a.name.localeCompare(b.name));
+  const available=[...new Set(repos.flatMap(keys))],columns=state.rowKeys===null?available:state.rowKeys.filter(k=>available.includes(k)),labels=new Map(repos.flatMap(r=>keys(r).map(k=>[k,r.metrics[k].label])));
+  const sorted=[...repos].sort((a,b)=>compareRepositories(a,b,state.sort));
+  $('#sort').textContent=state.sort==='name'?'Sort: name':'Sort: recent activity ↓';
   $('#cards').style.setProperty('--metric-count',Math.max(1,columns.length));
   $('#cards').classList.toggle('many-metrics',columns.length>8);
-  $('#cards').innerHTML=(repos.length?`<div class="project-column-head" aria-hidden="true"><span>Repository</span><div class="column-labels">${columns.map(k=>`<span>${e(labels.get(k))}</span>`).join('')}</div></div>`:'')+sorted.map(r=>`<article class="panel project-card" data-project="${e(r.id)}"><header class="project-header"><div class="project-heading"><div class="owner">${e(r.owner)}</div><button class="project-name" data-repo="${e(r.id)}" title="${e(r.owner+'/'+r.name)}">${e(r.name)}</button><div class="badges">${badges(r)}</div><div class="project-footer">${e(r.language)}</div></div></header><div class="metric-grid">${columns.filter(k=>keys(r).includes(k)).map(k=>{const m=r.metrics[k],g=chartView(m,state.data.dates,state.graphMode);return `<button class="spark-metric ${issueClass(k,m)}" title="${e(issueHint(k,m)||g.label)}" data-repo="${e(r.id)}" data-metric="${e(k)}" aria-haspopup="dialog" style="--metric-position:${columns.indexOf(k)+1}" aria-label="${e(r.name+': '+m.label+', '+fmt(m.value)+(issueHint(k,m)?', '+issueHint(k,m):''))}"><span class="spark-label">${e(m.label)}</span><span class="spark-value">${fmt(m.value)}</span><span class="spark-chart">${chart(g.points,{small:true,kind:g.kind})}</span><span class="spark-caption">${e(m.chartLabel?g.label:change(m))}</span></button>`;}).join('')}</div></article>`).join('')||`<div class="empty panel"><h3>${state.data.repos.length?'No matching projects':'Your observatory is ready'}</h3><p>${state.data.repos.length?'Try another search or visibility filter.':'Watch a repository to start collecting real history.'}</p><button id="empty-add">+ Watch repo</button></div>`;
+  $('#cards').innerHTML=(repos.length?`<div class="project-column-head" aria-hidden="true"><span>Repository</span><div class="column-labels">${columns.map(k=>`<span>${e(labels.get(k))}</span>`).join('')}</div></div>`:'')+sorted.map(r=>`<article class="panel project-card" data-project="${e(r.id)}"><header class="project-header"><div class="project-heading"><div class="owner">${e(r.owner)}</div><button class="project-name" data-repo="${e(r.id)}" title="${e(r.owner+'/'+r.name)}">${e(r.name)}</button><div class="badges">${badges(r)}</div><div class="project-footer">${e(r.language)}<button class="unwatch-button" data-unwatch="${e(r.id)}" aria-label="Unwatch ${e(r.owner+'/'+r.name)}" aria-haspopup="dialog">Unwatch</button></div></div></header><div class="metric-grid">${columns.filter(k=>keys(r).includes(k)).map(k=>{const m=r.metrics[k],g=chartView(m,state.data.dates,state.graphMode);return `<button class="spark-metric ${issueClass(k,m)}" title="${e(issueHint(k,m)||g.label)}" data-repo="${e(r.id)}" data-metric="${e(k)}" aria-haspopup="dialog" style="--metric-position:${columns.indexOf(k)+1}" aria-label="${e(r.name+': '+m.label+', '+fmt(m.value)+(issueHint(k,m)?', '+issueHint(k,m):''))}"><span class="spark-label">${e(m.label)}</span><span class="spark-value">${fmt(m.value)}</span><span class="spark-chart">${chart(g.points,{small:true,kind:g.kind})}</span><span class="spark-caption">${e(m.chartLabel?g.label:change(m))}</span></button>`;}).join('')}</div></article>`).join('')||`<div class="empty panel"><h3>${state.data.repos.length?'No matching projects':'Your observatory is ready'}</h3><p>${state.data.repos.length?'Try another search or visibility filter.':'Watch a repository to start collecting real history.'}</p><button id="empty-add">+ Watch repo</button></div>`;
   $$('#cards [data-repo]').forEach(button=>button.onclick=()=>button.dataset.metric?openMetricDialog(state.data.repos.find(r=>r.id===button.dataset.repo),button.dataset.metric):openRepo(button.dataset.repo));
+  bindUnwatch('#cards');
   if($('#empty-add'))$('#empty-add').onclick=openConnections;
 }
 function render(){
@@ -76,6 +81,8 @@ async function refresh(){
       const focus=document.activeElement,repo=focus?.dataset.repo,metric=focus?.dataset.metric,detailMetric=focus?.dataset.detailMetric;
       const tableOpen=$('#detail details')?.open;
       render();
+      if(state.page==='activity'&&activityScope().key!==activity?.key)loadEvents();
+      renderWatched();
       if(tableOpen&&$('#detail details'))$('#detail details').open=true;
       if(repo)$$('[data-repo]').find(b=>b.dataset.repo===repo&&b.dataset.metric===metric)?.focus({preventScroll:true});
       else if(detailMetric)$$('[data-detail-metric]').find(b=>b.dataset.detailMetric===detailMetric)?.focus({preventScroll:true});
@@ -84,20 +91,46 @@ async function refresh(){
   }
   catch{if(request===state.request&&state.csrf){if(state.dataRange){state.range=state.dataRange;persist();}$('#error').textContent='Refresh failed. Previously collected data is unchanged. Try Sync now or wait for the next refresh.';$('#error').hidden=false;}}
 }
-function showPage(page,focus=true){state.page=page;['overview','detail','activity','collection'].forEach(id=>$('#'+id).hidden=id!==page);$$('[data-page]').forEach(b=>{const active=b.dataset.page===(page==='detail'?'overview':page);b.classList.toggle('active',active);if(active)b.setAttribute('aria-current','page');else b.removeAttribute('aria-current');});$('#page-title').textContent={overview:'Aggregate',detail:'Project history',activity:'Activity',collection:'Collection'}[page];if(focus)$('#page-title').focus();if(page==='activity')loadEvents();if(page==='collection')loadStatus();}
+function showPage(page,focus=true){
+  cancelActivity();statusRequest++;state.page=page;
+  (page==='activity'?$('#activity-filters'):$('#overview .section-title')).append($('.table-tools'));
+  ['#sort','#repository-settings','#export'].forEach(selector=>$(selector).hidden=page==='activity');
+  ['overview','detail','activity','collection'].forEach(id=>$('#'+id).hidden=id!==page);
+  $$('[data-page]').forEach(b=>{const active=b.dataset.page===(page==='detail'?'overview':page);b.classList.toggle('active',active);if(active)b.setAttribute('aria-current','page');else b.removeAttribute('aria-current');});
+  $('#page-title').textContent={overview:'Aggregate',detail:'Project history',activity:'Activity',collection:'Logs'}[page];
+  if(focus)$('#page-title').focus();if(page==='activity')loadEvents();if(page==='collection')loadStatus();
+}
 function metricDetail(m,key,{interactive=false,expanded=false}={}){const coverage=m.chartCoverage||m.coverage,points=aligned(m,state.data.dates),count=points.filter(p=>finite(p.value)).length,g=chartView(m,state.data.dates,state.graphMode);return `<section class="panel detail-panel"><div class="detail-chart-top"><div><h2>${e(m.label)}</h2><p>${e(rangeLabel())}</p></div>${interactive?`<button class="detail-count" data-open-metric aria-haspopup="dialog" aria-label="Inspect ${e(m.label)} records">`:""}<strong class="${issueClass(key,m)}" title="${e(issueHint(key,m))}">${finite(m.value)?fmt(m.value):'Not observed'} <small>${e(m.unit)}</small></strong>${interactive?"</button>":""}</div><${interactive?'button':'div'} class="large-chart ${interactive?'chart-button':''}" ${interactive?'data-open-metric aria-haspopup="dialog"':'role="img"'} aria-label="${interactive?'Inspect ':''}${e(m.label)} observations">${chart(g.points,{kind:g.kind,width:interactive?Math.max(300,$('#detail').clientWidth-50):Math.max(300,Math.min(780,innerWidth-100))})}</${interactive?'button':'div'}>${m.chartLabel?`<p class="chart-explanation">Count: latest observed stars. Graph: ${e(g.label)} (does not subtract unstarring).</p>`:''}${g.cumulative?'<p class="chart-explanation">Running total of observed events within the selected range; missing days remain unknown. The observation table retains daily values.</p>':''}<p class="change">${e(change(m))}</p><dl class="provenance"><div><dt>Source</dt><dd>${e(m.source)}</dd></div><div><dt>Coverage</dt><dd>${count} of ${points.length} days${coverage?.start?' · '+e(coverage.start)+' to '+e(coverage.end):''}${coverage?.complete?' · complete':' · partial'}</dd></div><div><dt>Last collected</dt><dd>${e(dateText(m.lastSuccess))}</dd></div>${m.chartLabel?`${m.chartSource&&m.chartSource!==m.source?`<div><dt>Graph source</dt><dd>${e(m.chartSource)}</dd></div>`:''}<div><dt>Graph collected</dt><dd>${e(dateText(m.chartLastSuccess))}</dd></div>${errorStatus(m.chartStatus)?'<div><dt>Graph collection</dt><dd class="error">Latest graph collection failed; previous graph observations retained.</dd></div>':''}`:''}${errorStatus(m.status)?'<div><dt>Collection</dt><dd class="error">Latest collection failed; previous observations retained.</dd></div>':''}</dl><details ${expanded?'open':''}><summary>Observation table · raw daily values</summary><div class="table-wrap" tabindex="0" role="region" aria-label="Daily observation table"><table><caption>${e(m.label)} · ${e(rangeLabel())}</caption><thead><tr><th scope="col">Date</th><th scope="col">${e(m.chartLabel||m.unit)}</th></tr></thead><tbody>${points.map(p=>`<tr><th scope="row">${e(p.date)}</th><td>${finite(p.value)?fmt(p.value):'Not observed'}</td></tr>`).join('')}</tbody></table></div></details></section>`;}
 function openRepo(id,key){detailFocus=document.activeElement;state.detail={id,key};showPage('detail');renderDetail();}
 function renderDetail(){
   const r=state.data.repos.find(r=>r.id===state.detail?.id);if(!r){showPage('overview');return;}
   const available=keys(r);if(!available.includes(state.detail.key))state.detail.key=available[0];const m=r.metrics[state.detail.key],url=githubURL(r.url);
-  $('#detail').innerHTML=`<button class="back" id="back">← All projects</button><div class="detail-title-row"><div><div class="owner">${e(r.owner)}</div><h2>${e(r.name)}</h2><p>${e(r.description)}</p>${url?`<a href="${e(url)}" target="_blank" rel="noopener noreferrer">View on GitHub ↗</a>`:''}</div><div class="badges">${badges(r)}</div></div><div class="detail-summary">${available.map(k=>`<button data-detail-metric="${e(k)}" aria-pressed="${k===state.detail.key}">${e(r.metrics[k].label)}</button>`).join('')}</div>${m?metricDetail(m,state.detail.key,{interactive:true}):'<p class="empty">No observations collected yet.</p>'}<div class="detail-actions"><button id="pause">Pause watch</button><p class="tiny">Stop future collection without deleting stored history.</p></div>`;
+  $('#detail').innerHTML=`<button class="back" id="back">← All projects</button><div class="detail-title-row"><div><div class="owner">${e(r.owner)}</div><h2>${e(r.name)}</h2><p>${e(r.description)}</p>${url?`<a href="${e(url)}" target="_blank" rel="noopener noreferrer">View on GitHub ↗</a>`:''}</div><div class="badges">${badges(r)}</div></div><div class="detail-summary">${available.map(k=>`<button data-detail-metric="${e(k)}" aria-pressed="${k===state.detail.key}">${e(r.metrics[k].label)}</button>`).join('')}</div>${m?metricDetail(m,state.detail.key,{interactive:true}):'<p class="empty">No observations collected yet.</p>'}<div class="detail-actions"><button id="pause">Unwatch repository</button><p class="tiny">Stop future collection without deleting stored history.</p></div>`;
   $$('#detail [data-open-metric]').forEach(b=>b.onclick=()=>openMetricDialog(r,state.detail.key));
   $('#back').onclick=()=>{showPage('overview');if(detailFocus?.isConnected)detailFocus.focus();else $$('[data-repo]').find(b=>b.dataset.repo===r.id)?.focus();};
   $$('[data-detail-metric]').forEach(b=>b.onclick=()=>{state.detail.key=b.dataset.detailMetric;renderDetail();$$('[data-detail-metric]').find(x=>x.dataset.detailMetric===state.detail.key)?.focus();});
-  $('#pause').onclick=()=>openDialog('Pause this watch?',`<p>Pause collection for <strong>${e(r.owner+'/'+r.name)}</strong>? Stored history is kept.</p><button id="confirm-pause" class="primary">Pause collection</button>` ,()=>{$('#confirm-pause').onclick=()=>mutation($('#confirm-pause'),async()=>{await api('/api/watches/'+encodeURIComponent(r.id)+'/pause',{method:'POST',body:{}});const data=await refresh(),updated=data?.repos.find(repo=>repo.id===r.id),paused=updated&&Object.values(updated.metrics).some(metric=>metric.status==='paused');$('#dialog').close();notify(paused?'Watch paused. Stored history is retained.':'Pause request accepted. Check Collection to confirm its status.');});});
+  $('#pause').onclick=()=>confirmUnwatch(r);
 }
-function openDialog(title,html,setup){cancelDrilldown();if(!$('#dialog').open)dialogFocus=document.activeElement;$('#dialog').classList.remove('metric-dialog');$('#dialog-title').textContent=title;$('#dialog-body').innerHTML=html;$('#dialog-message').textContent='';if(!$('#dialog').open)$('#dialog').showModal();$('#dialog').scrollTop=0;setup?.();$('#close').focus();}
-function closeDialog(){cancelDrilldown();$('#dialog').close();restoreDialogFocus();}
+function bindUnwatch(scope){
+  $$(scope+' [data-unwatch]').forEach(button=>button.onclick=()=>{const r=state.data?.repos.find(r=>r.id===button.dataset.unwatch);if(r)confirmUnwatch(r);});
+}
+function renderWatched(){
+  if(!$('#watched-repositories'))return;
+  $('#watched-repositories').innerHTML=[...(state.data?.repos||[])].sort((a,b)=>compareRepositories(a,b,state.sort)).map(r=>`<div class="discovery-row" data-watched="${e(r.id)}"><div><strong>${e(r.owner+'/'+r.name)}</strong><div class="badges">${badges(r)}</div></div><button data-unwatch="${e(r.id)}" aria-label="Unwatch ${e(r.owner+'/'+r.name)}" aria-haspopup="dialog">Unwatch</button></div>`).join('')||'<p class="empty">No active watches.</p>';
+  bindUnwatch('#watched-repositories');
+}
+function confirmUnwatch(r){
+  openDialog('Unwatch this repository?',`<p>Unwatch <strong>${e(r.owner+'/'+r.name)}</strong>? This will stop collection and remove it from the active view. Stored history is retained. Add the same repository again to resume collection.</p><div class="drilldown-actions"><button id="confirm-pause" class="primary">Unwatch repository</button><button id="cancel-unwatch">Keep watching</button></div>`,()=>{
+    $('#cancel-unwatch').onclick=closeDialog;
+    $('#confirm-pause').onclick=()=>mutation($('#confirm-pause'),async active=>{
+      await api('/api/watches/'+encodeURIComponent(r.id)+'/pause',{method:'POST',body:{}});
+      const data=await refresh();if(!active())return;
+      closeDialog();notify(data&&!data.repos.some(repo=>repo.id===r.id)?'Unwatched. Stored history is retained. Add it again to resume.':'Unwatch request accepted, but removal could not be confirmed. Refresh to verify.');
+    });
+  });
+}
+function openDialog(title,html,setup){dialogSession++;cancelDrilldown();if(!$('#dialog').open)dialogFocus=document.activeElement;$('#dialog').classList.remove('metric-dialog');$('#dialog-title').textContent=title;$('#dialog-body').innerHTML=html;$('#dialog-message').textContent='';if(!$('#dialog').open)$('#dialog').showModal();$('#dialog').scrollTop=0;setup?.();$('#close').focus();}
+function closeDialog(){dialogSession++;cancelDrilldown();$('#dialog').close();restoreDialogFocus();}
 $('#close').onclick=closeDialog;
 $('#dialog').addEventListener('cancel',event=>{event.preventDefault();closeDialog();});
 function restoreDialogFocus(){
@@ -145,7 +178,7 @@ function renderMetricRecords(view){
     const type=data.kind==='snapshot'?'Current snapshot — not filtered by the selected date range.':data.kind==='events'?'Stored events in the selected date range.':'Daily observations only. Individual records are not collected for this metric; use the observation table below.';
     const freshness=data.observedAt?` Observed ${dateText(data.observedAt)}.`:' Observation time unavailable.';
     const health=errorStatus(data.status)||['stale','details_incomplete'].includes(data.status)?' Collection is stale or incomplete; retained records may not reflect GitHub now.':data.status==='paused'?' Collection is paused; retained records may be outdated.':data.status==='ok'?'':data.status==='not_collected'?' No successful record collection is available yet.':` Collection status: ${data.status||'unknown'}.`;
-    message=type+freshness+health+(data.complete?'':' Collection coverage is partial; this is not a complete inventory.')+(data.kind==='observations'?'':` Showing ${view.items.length} of ${data.total} stored records.`);
+    message=type+freshness+health+(data.complete?'':' Collection coverage is partial; this is not a complete inventory.')+(plain(data.coverage?.label)?' '+plain(data.coverage.label):'')+(data.kind==='observations'?'':` Showing ${view.items.length} of ${data.total} stored records.`);
     if(!view.items.length&&data.kind!=='observations')message+=' No stored records were returned; this does not establish that no activity exists on GitHub.';
   }
   if(view.changed)message+=' The stored inventory changed while paging. Close and reopen this dialog to load a consistent snapshot.';
@@ -153,7 +186,7 @@ function renderMetricRecords(view){
   else if(loading&&data)message+=' Loading more…';
   $('#records-state').textContent=message;
   $('#records-state').classList.toggle('error',view.error);
-  $('#records-table').innerHTML=view.items.length?`<div class="table-wrap record-wrap" tabindex="0" role="region" aria-label="Stored record table"><table class="record-table"><caption>${data.kind==='snapshot'?'Open issues · latest stored snapshot':'Collected event records'}</caption><thead><tr><th scope="col">${data.kind==='snapshot'?'Created':'Date'}</th><th scope="col">${data.kind==='snapshot'?'Issue':'Record'} / GitHub action</th><th scope="col">Author</th></tr></thead><tbody>${view.items.map(item=>{const url=githubURL(item.url);return `<tr><td>${e(item.date?dateText(item.date):'Unknown date')}</td><th scope="row">${url?`<a href="${e(url)}" target="_blank" rel="noopener noreferrer">${e(item.title||'Untitled record')} ↗</a>`:e(item.title||'Untitled record')}</th><td>${e(item.author||'Not recorded')}</td></tr>`;}).join('')}</tbody></table></div>`:'';
+  $('#records-table').innerHTML=view.items.length?`<div class="table-wrap record-wrap" tabindex="0" role="region" aria-label="Stored record table"><table class="record-table"><caption>${data.kind==='snapshot'?'Open issues · latest stored snapshot':'Collected event records'}</caption><thead><tr><th scope="col">${data.kind==='snapshot'?'Created':'Date'}</th><th scope="col">${data.kind==='snapshot'?'Issue':'Record'} / GitHub action</th><th scope="col">Author</th></tr></thead><tbody>${view.items.map(raw=>{const item={...raw,type:raw.type||view.key},url=githubURL(item.url);return `<tr><td>${e(item.date?dateText(item.date):'Unknown date')}</td><th scope="row">${url?`<a href="${e(url)}" target="_blank" rel="noopener noreferrer">${e(recordTitle(item))} ↗</a>`:e(recordTitle(item))}${recordContext(item)}</th><td class="event-actor">${actorHTML(item)}</td></tr>`;}).join('')}</tbody></table></div>`:'';
   const more=$('#records-more');more.hidden=view.changed||!(view.error||data?.hasMore);more.disabled=loading;more.textContent=loading?'Loading…':view.error?'Try again':'Load more';
 }
 async function loadMetricRecords(view){
@@ -175,52 +208,138 @@ async function loadMetricRecords(view){
   }catch{if(active())view.error=true;}
   finally{if(active()){const hadFocus=document.activeElement.id==='records-more';view.loading=false;renderMetricRecords(view);if(hadFocus&&$('#records-more').hidden){$('#records-state').tabIndex=-1;$('#records-state').focus({preventScroll:true});}}}
 }
-async function mutation(button,work){button.disabled=true;try{await work();}catch{if(state.csrf){const message='The request could not be completed. Please try again.';if($('#dialog').open)$('#dialog-message').textContent=message;else notify(message);}}finally{if(button.isConnected)button.disabled=button.id==='sync'&&!!state.data?.collecting;}}
-function openConnections(){
-  openDialog('Settings',`<section><h3>Open issue alerts</h3><p>Highlight counts strictly above these thresholds. Saved in this browser.</p><form id="preferences-form"><div class="threshold-fields"><label>Yellow above<input id="issue-warning" type="number" min="0" step="1" required value="${state.issueThresholds.warning}"></label><label>Red above<input id="issue-danger" type="number" min="0" step="1" required value="${state.issueThresholds.danger}"></label></div><h3>Top cards</h3><p>Choose four different metrics. Cards follow the current filters. Saved in this browser.</p><div class="card-fields">${state.chartKeys.map((key,slot)=>`<label>Card ${slot+1}<select id="card-metric-${slot}" data-card-setting="${slot}">${Object.entries(CARD_METRICS).map(([value,label])=>`<option value="${e(value)}" ${value===key?'selected':''}>${e(label)}</option>`).join('')}</select></label>`).join('')}</div><button type="submit">Save settings</button><p id="preferences-message" role="status"></p></form></section><h3>Connections & watches</h3><p>Watch a public repository anonymously, or choose owned repositories from your existing local connection. No GitHub token is entered in this browser.</p><form id="watch-form"><label for="repository">Public repository URL or owner/repository</label><input id="repository" required autocomplete="off" spellcheck="false" placeholder="owner/repository"><button class="primary" type="submit">Add public watch</button></form><section class="connection-section"><h3>Existing connection</h3><p>${state.data?.credentialConfigured?'A local credential is configured. Choose repositories explicitly.':'No local credential is configured. Public watches are available.'}</p><button id="discover" ${state.data?.credentialConfigured?'':'disabled'}>Choose owned repositories</button><div id="discovery"></div></section>`,()=>{
+async function mutation(button,work){
+  const inDialog=!!button.closest('#dialog'),active=inDialog?dialogActive(dialogSession):()=>!!state.csrf;
+  button.disabled=true;
+  try{await work(active);}
+  catch{if(active()){const message='The request could not be completed. Please try again.';if(inDialog)$('#dialog-message').textContent=message;else notify(message);}}
+  finally{if(active()&&button.isConnected)button.disabled=button.id==='sync'&&!!state.data?.collecting;}
+}
+function openConnections(section){
+  const rowOptions=Object.keys(CARD_METRICS);
+  openDialog('Settings',`<section><h3>Open issue alerts</h3><p>Highlight counts strictly above these thresholds. Saved in this browser.</p><form id="preferences-form"><div class="threshold-fields"><label>Yellow above<input id="issue-warning" type="number" min="0" step="1" required value="${state.issueThresholds.warning}"></label><label>Red above<input id="issue-danger" type="number" min="0" step="1" required value="${state.issueThresholds.danger}"></label></div><h3>Top cards</h3><p>Choose four different metrics. Cards follow the current filters. Saved in this browser.</p><div class="card-fields">${state.chartKeys.map((key,slot)=>`<label>Card ${slot+1}<select id="card-metric-${slot}" data-card-setting="${slot}">${Object.entries(CARD_METRICS).map(([value,label])=>`<option value="${e(value)}" ${value===key?'selected':''}>${e(label)}</option>`).join('')}</select></label>`).join('')}</div><section aria-labelledby="repository-graphs"><h3 id="repository-graphs" tabindex="-1">Repository graphs</h3><p>Choose metrics for repository rows, independently of the four top cards. Uncollected metrics stay hidden.</p><label for="repository-sort">Default repository sort</label><select id="repository-sort"><option value="activity" ${state.sort==='activity'?'selected':''}>Recent activity (newest first)</option><option value="name" ${state.sort==='name'?'selected':''}>Repository name (A–Z)</option></select><p class="tiny">Newest persisted event time; never sync freshness or current counts. Ties use repository name.</p><label class="row-choice"><input type="checkbox" id="row-all" ${state.rowKeys===null?'checked':''}> All observed metrics, including newly collected ones</label><div class="row-fields">${rowOptions.map(key=>`<label class="row-choice"><input type="checkbox" data-row-setting="${e(key)}" ${state.rowKeys===null||state.rowKeys.includes(key)?'checked':''}> ${e(CARD_METRICS[key])}</label>`).join('')}</div></section><button type="submit">Save settings</button><p id="preferences-message" role="status"></p></form></section><h3>Watched repositories</h3><p>Unwatch stops collection and removes a repository from active views, retaining its history. Add the same repository again to resume.</p><div id="watched-repositories"></div><h3>Connections & watches</h3><p>Watch a public repository anonymously, or choose owned repositories from your existing local connection. No GitHub token is entered in this browser.</p><form id="watch-form"><label for="repository">Public repository URL or owner/repository</label><input id="repository" required autocomplete="off" spellcheck="false" placeholder="owner/repository"><button class="primary" type="submit">Add public watch</button></form><section class="connection-section"><h3>Existing connection</h3><p>${state.data?.credentialConfigured?'A local credential is configured. Choose repositories explicitly.':'No local credential is configured. Public watches are available.'}</p><button id="discover" ${state.data?.credentialConfigured?'':'disabled'}>Choose owned repositories</button><div id="discovery"></div></section>`,()=>{
+    renderWatched();
+    $('#row-all').onchange=()=>{if($('#row-all').checked)$$('[data-row-setting]').forEach(input=>input.checked=true);};
+    $$('[data-row-setting]').forEach(input=>input.onchange=()=>$('#row-all').checked=false);
     $('#preferences-form').onsubmit=event=>{
       event.preventDefault();const thresholds=validateThresholds({warning:Number($('#issue-warning').value),danger:Number($('#issue-danger').value)});
       if(!thresholds){$('#preferences-message').textContent='Use nonnegative whole numbers; red must be higher than yellow.';return;}
       const chartKeys=validateChartKeys($$('[data-card-setting]').map(select=>select.value));
       if(!chartKeys){$('#preferences-message').textContent='Choose four different supported metrics.';return;}
-      state.issueThresholds=thresholds;state.chartKeys=chartKeys;const saved=savePreferences();
+      state.issueThresholds=thresholds;state.chartKeys=chartKeys;state.sort=$('#repository-sort').value;state.rowKeys=$('#row-all').checked?null:validateRowKeys($$('[data-row-setting]:checked').map(input=>input.dataset.rowSetting));const saved=savePreferences();
       render();$('#preferences-message').textContent=saved?'Settings saved.':'Applied to this tab; browser storage is unavailable.';
     };
-    $('#watch-form').onsubmit=event=>{event.preventDefault();const value=$('#repository').value.trim();let valid=/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(value);try{const u=new URL(value);valid=!!githubURL(value)&&/^\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/?$/.test(u.pathname)&&!u.hash&&!u.search;}catch{}if(!valid){$('#dialog-message').textContent='Use owner/repository or an HTTPS github.com repository URL.';return;}mutation($('#watch-form button'),async()=>{const result=await api('/api/watches',{method:'POST',body:{repository:value,access:'public'}}),data=await refresh();if(!$('#repository'))return;$('#repository').value='';$('#dialog-message').textContent=data?.repos.some(r=>r.id===result.repository.id)?'Public watch added.':'Request accepted. Refresh to confirm the stored watch.';});};
+    $('#watch-form').onsubmit=event=>{event.preventDefault();const value=$('#repository').value.trim();let valid=/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(value);try{const u=new URL(value);valid=!!githubURL(value)&&/^\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/?$/.test(u.pathname)&&!u.hash&&!u.search;}catch{}if(!valid){$('#dialog-message').textContent='Use owner/repository or an HTTPS github.com repository URL.';return;}mutation($('#watch-form button'),async active=>{const result=await api('/api/watches',{method:'POST',body:{repository:value,access:'public'}}),data=await refresh();if(!active())return;$('#repository').value='';renderWatched();$('#dialog-message').textContent=data?.repos.some(r=>r.id===result.repository.id)?'Public watch added.':'Request accepted. Refresh to confirm the stored watch.';});};
     $('#discover').onclick=()=>mutation($('#discover'),loadDiscover);
   });
+  if(section==='repository-graphs'){$('#repository-graphs').focus();$('#repository-graphs').scrollIntoView({block:'start'});}
 }
-async function loadDiscover(){
-  const data=await api('/api/discover');if(!$('#discovery'))return;
+async function loadDiscover(active=dialogActive(dialogSession)){
+  if(!active())return;
+  const data=await api('/api/discover');if(!active())return;
   if(data.status&&!['ok','partial'].includes(data.status)){$('#discovery').textContent='Repository discovery could not be completed. Please try again.';return;}
   $('#discovery').innerHTML=data.repositories.map((r,i)=>`<div class="discovery-row"><div><strong>${e(r.owner+'/'+r.name)}</strong><div class="badges">${badges(r)}</div></div><button data-add-owned="${i}" ${r.watched?'disabled':''}>${r.watched?'Watching':'Add'}</button></div>`).join('')||'<p class="empty">No owned repositories were returned.</p>';
   if(data.complete===false)$('#discovery').insertAdjacentHTML('afterbegin','<p class="notice">Showing available owned repositories; discovery is incomplete.</p>');
-  $$('[data-add-owned]').forEach(b=>b.onclick=()=>mutation(b,async()=>{const r=data.repositories[Number(b.dataset.addOwned)],result=await api('/api/watches',{method:'POST',body:{repository:r.owner+'/'+r.name,access:'token'}});const [updated]=await Promise.all([refresh(),loadDiscover()]);$('#dialog-message').textContent=updated?.repos.some(repo=>repo.id===result.repository.id)?'Repository watch added.':'Request accepted. Refresh to confirm the stored watch.';}));
+  $$('[data-add-owned]').forEach(b=>b.onclick=()=>mutation(b,async active=>{const r=data.repositories[Number(b.dataset.addOwned)],result=await api('/api/watches',{method:'POST',body:{repository:r.owner+'/'+r.name,access:'token'}});const [updated]=await Promise.all([refresh(),loadDiscover(active)]);if(!active())return;renderWatched();$('#dialog-message').textContent=updated?.repos.some(repo=>repo.id===result.repository.id)?'Repository watch added.':'Request accepted. Refresh to confirm the stored watch.';}));
 }
-async function loadEvents(){
-  $('#events').textContent='Loading activity…';
-  try{const {events}=await api('/api/events?limit=100');if(!state.csrf)return;$('#events').innerHTML=events.map(event=>{const url=githubURL(event.url);return `<article class="panel event"><div class="tiny">${e(event.repository)} · ${e(event.type)} · ${e(dateText(event.date))}</div><h2>${url?`<a href="${e(url)}" target="_blank" rel="noopener noreferrer">${e(event.title)}</a>`:e(event.title)}</h2>${event.author?`<p>${e(event.author)}</p>`:''}</article>`;}).join('')||'<p class="empty">No activity has been collected yet.</p>';}
-  catch{if(state.csrf)$('#events').textContent='Activity could not be loaded. Please try again.';}
+const eventLabels={commits:'Commit',commit:'Commit',merged_prs:'Merged PR',releases:'Release',stars:'Star',forks:'Fork',issues:'Issue',pull_requests:'Pull request'};
+const plain=value=>typeof value==='string'?value:typeof value==='number'&&finite(value)?String(value):'';
+function recordTitle(item){
+  const title=plain(item.title).split('\n')[0].trim();
+  return /^(?:Commit\s+)?[a-f0-9]{7,64}$/i.test(title)?'Commit (title not recorded)':title||'Title not recorded';
+}
+function actorHTML(item){
+  const actor=item.actor||{},name=plain(actor.name),login=plain(actor.login),author=plain(item.author);
+  const text=name&&login?`${name} (@${login})`:name||login&&'@'+login||author;
+  if(!text||/\S+@\S+\.\S+/.test(text))return '<span>Actor not recorded</span>';
+  const url=githubURL(actor.url);
+  return url?`<a href="${e(url)}" target="_blank" rel="noopener noreferrer">${e(text)}</a>`:e(text);
+}
+function recordContext(item){
+  const meta=item.metadata||{},sha=plain(meta.sha)||(/^(?:Commit\s+)?[a-f0-9]{7,64}$/i.test(plain(item.title))?plain(item.title).replace(/^Commit\s+/i,''):''),fields=[['SHA',sha],['Branch',meta.branch],[item.type==='merged_prs'?'PR':'Number',meta.number?'#'+plain(meta.number):''],['Action',meta.action],['Ref',meta.ref],['Ref type',meta.refType],['Commits',meta.commitCount],['Head',meta.head],['Base',meta.base]].filter(([,v])=>plain(v)!=='');
+  const summary=plain(item.summary);
+  return (summary?`<p class="event-summary">${e(summary)}</p>`:'')+(fields.length?`<dl class="event-metadata">${fields.map(([label,value])=>`<div><dt>${label}</dt><dd>${e(plain(value))}</dd></div>`).join('')}</dl>`:'');
+}
+function eventHTML(item){
+  const url=githubURL(item.url),type=eventLabels[item.type]||plain(item.type).replaceAll('_',' ');
+  return `<article class="panel event"><div class="event-heading"><span class="event-type">${e(type||'Activity')}</span><span>${e(item.repository)}</span><time datetime="${e(item.date)}">${e(item.date?dateText(item.date):'Date not recorded')}</time></div><h2>${url?`<a href="${e(url)}" target="_blank" rel="noopener noreferrer">${e(recordTitle(item))} ↗</a>`:e(recordTitle(item))}</h2><p class="event-actor">${actorHTML(item)}</p>${recordContext(item)}${item.source||item.observedAt?`<p class="event-provenance">${e(item.source)}${item.observedAt?' · Observed '+e(dateText(item.observedAt)):''}</p>`:''}</article>`;
+}
+function activityScope(){
+  const repos=filtered(),params=new URLSearchParams({range:state.dataRange||state.range});
+  if(repos.length===1)params.set('repository',repos[0].id);
+  else{
+    if(state.visibility!=='all')params.set('visibility',state.visibility);
+    const search=$('#search').value.trim();if(search)params.set('search',search);
+    if($('#archived').checked)params.set('archived','true');
+  }
+  return {params,empty:!repos.length,key:params.toString()+'|'+repos.map(r=>r.id).sort().join(',')};
+}
+function renderEvents(view){
+  $('#activity').setAttribute('aria-busy',String(view.loading));
+  const page=view.page;
+  let message=view.empty?'No matching repositories. Adjust the repository filters.':page?`Showing ${view.items.length} of ${page.total} stored events · ${rangeLabel()}. Collected observations only; not a complete GitHub history. ${plain(page.coverage?.label)}`:'Loading activity…';
+  if(page?.legacy)message+=' Pagination is unavailable for this older response; additional history may exist.';
+  if(view.changed)message+=' Stored activity changed while paging. Refresh activity to restart from the latest events.';
+  if(view.error)message=(page?message+' Existing rows are unchanged. ':'')+'Activity could not be loaded. Please try again.';
+  else if(view.loading&&page)message+=' Loading activity…';
+  if(page&&!page.total)message+=' No stored events in this range; this does not establish that no activity exists on GitHub.';
+  $('#events-state').textContent=message;$('#events-state').classList.toggle('error',!!view.error);
+  $('#events').innerHTML=view.items.map(eventHTML).join('');
+  $('#events-more').hidden=view.changed||!page?.hasMore;$('#events-more').disabled=view.loading;
+  $('#reload-events').disabled=view.loading;
+}
+async function loadEvents(more=false){
+  if(!state.csrf||state.page!=='activity'||!state.data)return;
+  more=more===true;
+  const scope=activityScope(),previous=activity;
+  if(more&&(!previous||previous.loading||previous.changed||!previous.page?.hasMore))return;
+  if(more&&previous.key!==scope.key)more=false;
+  if(!more){
+    previous?.controller.abort();
+    // Keep good rows only when refreshing exactly the same scope.
+    activity={...scope,items:previous?.key===scope.key?previous.items:[],page:previous?.key===scope.key?previous.page:null,next:previous?.key===scope.key?previous.next:0,changed:previous?.key===scope.key&&!!previous.changed,controller:new AbortController()};
+  }
+  const view=activity,active=()=>activity===view&&state.page==='activity'&&!!state.csrf;
+  if(view.empty){view.items=[];view.page=null;view.loading=false;renderEvents(view);return;}
+  const offset=more?view.next:0;view.loading=true;view.error=false;renderEvents(view);
+  try{
+    const params=new URLSearchParams({limit:'50',offset:String(offset),...Object.fromEntries(scope.params)});
+    let data=await api('/api/events?'+params,{signal:view.controller.signal});if(!active())return;
+    // Legacy inventories were capped at 500; modern pages still obey limit=50.
+    // Detect compatibility locally, never trust a server-supplied legacy flag.
+    const legacy=Array.isArray(data.events)&&data.total===undefined&&data.hasMore===undefined&&offset===0;
+    data=legacy?{...data,total:data.events.length,offset:0,limit:50,hasMore:false,legacy:true}:{...data,legacy:false};
+    if(!Array.isArray(data.events)||data.events.length>(legacy?500:50)||!Number.isSafeInteger(data.total)||data.total<0||data.offset!==offset||data.limit!==50||typeof data.hasMore!=='boolean'||data.events.some(item=>!item||typeof item.id!=='string'||typeof item.title!=='string'))throw Error('Invalid activity page');
+    if(more&&data.total!==view.page.total){view.changed=true;throw Error('Activity changed');}
+    const ids=new Set(more?view.items.map(item=>item.id):[]);
+    if(data.events.some(item=>{if(ids.has(item.id))return true;ids.add(item.id);return false;})){if(more)view.changed=true;throw Error('Repeated page');}
+    const next=offset+data.events.length;
+    if(next>data.total||data.hasMore&&(!data.events.length||next>=data.total)||!data.hasMore&&next!==data.total)throw Error('Inconsistent pagination');
+    view.items=more?[...view.items,...data.events]:data.events;view.page=data;view.next=next;view.changed=false;
+  }catch{if(active())view.error=true;}
+  finally{if(active()){const hadFocus=document.activeElement.id==='events-more';view.loading=false;renderEvents(view);if(hadFocus&&$('#events-more').hidden){$('#events-state').tabIndex=-1;$('#events-state').focus({preventScroll:true});}}}
 }
 async function loadStatus(){
-  $('#collection-content').textContent='Loading collection status…';
-  try{const status=await api('/api/status');if(!state.csrf)return;$('#collection-content').innerHTML=`<section class="panel pad"><h2>${status.collecting?'Collection running':'Collection schedule'}</h2><dl class="provenance"><div><dt>Last attempt</dt><dd>${e(dateText(status.lastAttempt))}</dd></div><div><dt>Last success</dt><dd>${e(dateText(status.lastSuccess))}</dd></div>${status.nextRun?`<div><dt>Next run</dt><dd>${e(dateText(status.nextRun))}</dd></div>`:''}</dl></section><div class="timeline">${(status.runs||[]).map(run=>`<article class="panel event"><h3>${e(run.repository)} · ${e(run.metric)}</h3><p class="${errorStatus(run.status)?'error':''}">${e(run.status)}</p><p class="tiny">Attempt: ${e(dateText(run.lastAttempt))} · Last success: ${e(dateText(run.lastSuccess))}</p>${run.message?`<p>${e(run.message)}</p>`:''}</article>`).join('')||'<p class="empty">No collection attempts yet.</p>'}</div>`;}
-  catch{if(state.csrf)$('#collection-content').textContent='Collection status could not be loaded. Please try again.';}
+  const request=++statusRequest,active=()=>request===statusRequest&&state.page==='collection'&&!!state.csrf;
+  $('#collection-content').textContent='Loading logs…';
+  try{const status=await api('/api/status');if(!active())return;$('#collection-content').innerHTML=`<section class="panel pad"><h2>${status.collecting?'Collection running':'Collection schedule'}</h2><dl class="provenance"><div><dt>Last attempt</dt><dd>${e(dateText(status.lastAttempt))}</dd></div><div><dt>Last success</dt><dd>${e(dateText(status.lastSuccess))}</dd></div>${status.nextRun?`<div><dt>Next run</dt><dd>${e(dateText(status.nextRun))}</dd></div>`:''}</dl></section><div class="timeline">${(status.runs||[]).map(run=>`<article class="panel event"><h3>${e(run.repository)} · ${e(run.metric)}</h3><p class="${errorStatus(run.status)?'error':''}">${e(run.status)}</p><p class="tiny">Attempt: ${e(dateText(run.lastAttempt))} · Last success: ${e(dateText(run.lastSuccess))}</p>${run.message?`<p>${e(run.message)}</p>`:''}</article>`).join('')||'<p class="empty">No collection attempts yet.</p>'}</div>`;}
+  catch{if(active())$('#collection-content').textContent='Logs could not be loaded. Please try again.';}
 }
-$('#settings').onclick=openConnections;$('#add').onclick=openConnections;
+$('#settings').onclick=openConnections;$('#add').onclick=openConnections;$('#repository-settings').onclick=()=>openConnections('repository-graphs');
 $$('[data-page]').forEach(b=>b.onclick=()=>showPage(b.dataset.page));
 $$('[data-range]').forEach(b=>b.onclick=async()=>{if(state.range===b.dataset.range)return;state.range=b.dataset.range;persist();await refresh();});
 $$('[data-chart-mode]').forEach(button=>button.onclick=()=>{
   state.graphMode=button.dataset.chartMode;try{localStorage.setItem(chartModeKey,state.graphMode);}catch{}
   const tableOpen=$('#detail details')?.open;render();if(tableOpen&&$('#detail details'))$('#detail details').open=true;
 });
-$('#search').oninput=render;$('#scope-filter').onchange=()=>{state.visibility=$('#scope-filter').value;persist();render();};$('#archived').onchange=render;
-$('#sort').onclick=()=>{state.sort=state.sort==='name'?'activity':'name';$('#sort').textContent=state.sort==='name'?'Sort: name':'Sort: activity ↓';renderCards(filtered());};
+function filterChanged(){render();if(state.page==='activity')loadEvents();}
+$('#search').oninput=filterChanged;$('#scope-filter').onchange=()=>{state.visibility=$('#scope-filter').value;persist();filterChanged();};$('#archived').onchange=filterChanged;
+$('#sort').onclick=()=>{state.sort=state.sort==='name'?'activity':'name';if(!savePreferences())notify('Applied to this tab; browser storage is unavailable.');renderCards(filtered());};
 $('#sync').onclick=()=>mutation($('#sync'),async()=>{const result=await api('/api/sync',{method:'POST',body:{}});notify(result.started?'Collection started. New observations will appear automatically.':'Collection is already running.');await refresh();});
-$('#reload-events').onclick=loadEvents;$('#reload-status').onclick=loadStatus;
+$('#reload-events').onclick=()=>loadEvents();$('#events-more').onclick=()=>loadEvents(true);$('#reload-status').onclick=loadStatus;
 $('#export').onclick=()=>{const blob=new Blob([exportCSV(filtered(),state.dataRange || state.range)],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='github-observatory.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);};
 function setTheme(light){document.body.classList.toggle('light',light);$('#theme').setAttribute('aria-label',light?'Switch to dark theme':'Switch to light theme');}
 try{setTheme(localStorage.getItem('github-observatory-theme')!=='dark');}catch{setTheme(true);}
 $('#theme').onclick=()=>{setTheme(!document.body.classList.contains('light'));try{localStorage.setItem('github-observatory-theme',document.body.classList.contains('light')?'light':'dark');}catch{}};
-setInterval(()=>{if(state.csrf&&!document.hidden){refresh();if(state.page==='activity')loadEvents();if(state.page==='collection')loadStatus();}},30000);
+setInterval(async()=>{if(state.csrf&&!document.hidden){await refresh();if(state.page==='activity'&&!activity?.loading&&(activity?.next||0)<=50)loadEvents();if(state.page==='collection')loadStatus();}},30000);
 authenticate(unlockKey);unlockKey=null;

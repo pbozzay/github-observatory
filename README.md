@@ -65,6 +65,18 @@ Use the same data directory when starting and opening a local instance. For Dock
 - Metrics without individual records show actual observations plus appropriate GitHub destinations: stargazers, forks, traffic, and repository activity. Counts are never turned into invented records.
 - Tables preserve raw daily values even in Cumulative mode. Unknown is not zero. Pagination, incomplete coverage, and stale observations are explicitly identified.
 - Repository names still open a full history view. Modals support keyboard access, Escape, focus restoration, and mobile scrolling.
+- Repository rows default to **recent activity**, with a remembered name/activity choice in Settings. The small cog above the rows opens **Repository graphs** directly; row metric choices are independent of the four top cards.
+- **Unwatch** is available on each row and in Settings. It stops collection and removes the repository from active views while retaining history; adding the same repository again resumes it. Technical collection diagnostics are under **Logs**.
+
+## Activity that explains what happened
+
+Activity preserves real commit titles, author names/logins, timestamps, and useful context such as branch, PR number, merge refs, or release tag. Commit hashes are secondary identifiers, not the headline. Descriptive text is bounded and rendered as text; source code, diffs, email fields and raw provider responses are not collected.
+
+The repository Events API adds observed stars and forks with actor profile links, pushes, issue activity, reviews, comments, ref changes, and other event types. Push events are distinct from individual commits: a push actor is not necessarily a commit author, and missing counts are not invented. Paginated activity and named star/fork details expose retained records, not people inferred from aggregate counters.
+
+**This is not an exhaustive GitHub audit log.** GitHub's [Events API limits](https://docs.github.com/en/rest/activity/events) are up to **300 events from the past 30 days**, with **30 seconds–6 hours** of delay. Permission failures, collection budgets and gaps between polls can reduce coverage further. Once collected, records are retained locally. Historic surviving stargazers/forks are not silently treated as complete event history, and collection does not request broader permissions.
+
+Repository activity is stored separately from metric observations, so adding feed events cannot inflate commit counts or erase existing chart history. Duplicate merge/release records are reconciled with authoritative endpoint records. Old databases upgrade without deleting observations; legacy commit titles become available after a successful refresh, rather than being guessed from a hash.
 
 ## Data, not demo numbers
 

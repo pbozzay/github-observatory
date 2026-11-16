@@ -73,7 +73,9 @@ export function createServer({service,publicDir,unlockKey,publicOrigin,proxyKey,
     if(req.method==='GET'&&route==='/api/dashboard'){send(200,service.dashboard(rangeOf(url)));return;}
     if(req.method==='GET'&&route==='/api/status'){send(200,service.status());return;}
     if(req.method==='GET'&&route==='/api/events'){
-     const limit=Number(url.searchParams.get('limit')||100);if(!Number.isInteger(limit)||limit<1||limit>500)throw problem(400,'Invalid event limit.');send(200,service.events(limit));return;
+     for(const key of ['repository','range','offset','limit','visibility','search','archived'])if(url.searchParams.getAll(key).length>1)throw problem(400,'Ambiguous activity parameter.');
+     const filters=Object.fromEntries(['repository','visibility','search','archived'].filter(key=>url.searchParams.has(key)).map(key=>[key,url.searchParams.get(key)]));
+     send(200,service.activity({...filters,range:url.searchParams.get('range')??'all',offset:url.searchParams.get('offset')??'0',limit:url.searchParams.get('limit')??'100'}));return;
     }
     if(req.method==='GET'&&route==='/api/details'){
      for(const key of ['repository','metric','range','offset','limit'])if(url.searchParams.getAll(key).length>1)throw problem(400,'Ambiguous detail parameter.');

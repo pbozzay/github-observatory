@@ -13,7 +13,7 @@ async function fixture(t, options = {}) {
   const dbPath = join(directory, 'test.sqlite');
   const calls = [];
   const state = { now: NOW, issues: [issue(1)], commits: [
-    { sha: 'abc1', commit: { committer: { date: '2026-06-20T05:00:00Z' } }, author: { login: 'synthetic-author' } },
+    { sha: 'abc1', commit: { message: 'A genuine commit title', committer: { date: '2026-06-20T05:00:00Z' } }, author: { login: 'synthetic-author' } },
     { sha: 'abc2', commit: { committer: { date: '2026-06-14T00:00:00Z' } } },
     { sha: 'abc3', commit: { committer: { date: '2026-06-13T23:59:59Z' } } },
   ] };
@@ -31,6 +31,7 @@ async function fixture(t, options = {}) {
     else if (endpoint === 'traffic/views') value = { views: [] };
     else if (endpoint === 'traffic/clones') value = { clones: [] };
     else if (endpoint === 'stargazers/history') value = [];
+    else if (endpoint === 'events') value = [];
     else throw new Error(`Unexpected synthetic route: ${url.pathname}`);
     return value instanceof Response ? value : Response.json(value);
   };
@@ -48,7 +49,7 @@ test('details filter exact repository, metric and inclusive dashboard days with 
   await service.sync();
   const requests = calls.length;
   const first = service.details(query('commits', { limit: 1 }));
-  assert.deepEqual(first, { items: [{ id: '101:commits:abc1', date: '2026-06-20', title: 'Commit abc1', url: 'https://github.com/example/sample/commit/abc1', author: 'synthetic-author' }], total: 2, hasMore: true, offset: 0, limit: 1, kind: 'events', observedAt: NOW, status: 'ok', complete: true });
+  assert.deepEqual(first, { items: [{ id: '101:commits:abc1', repository: 'example/sample', repositoryId: '101', type: 'commits', date: '2026-06-20T05:00:00.000Z', title: 'A genuine commit title', url: 'https://github.com/example/sample/commit/abc1', author: 'synthetic-author', actor: { login: 'synthetic-author', url: 'https://github.com/synthetic-author' }, metadata: { sha: 'abc1', branch: 'main' }, observedAt: NOW, source: 'commits' }], total: 2, hasMore: true, offset: 0, limit: 1, kind: 'events', observedAt: NOW, status: 'ok', complete: true });
   const next = service.details(query('commits', { offset: '1', limit: '1' }));
   assert.deepEqual(next.items.map(x => x.id), ['101:commits:abc2']);
   assert.equal(next.hasMore, false);

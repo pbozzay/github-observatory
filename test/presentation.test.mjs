@@ -1,7 +1,25 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {presentRepository,aggregate,chart,issueLevel,validateThresholds,chartView,validateChartKeys,githubMetricAction} from '../public/metrics.js';
+import {presentRepository,aggregate,chart,issueLevel,validateThresholds,chartView,validateChartKeys,githubMetricAction,repositoryActivity,compareRepositories,validateRowKeys} from '../public/metrics.js';
 const dates=['2026-01-01','2026-01-02','2026-01-03'];
+test('recent activity uses persisted event time, never totals, balances or sync freshness',()=>{
+ const repo=(name,lastActivityAt)=>({name,owner:'synthetic-labs',lastActivityAt,metrics:{}});
+ const old={...repo('alpha','2026-01-01T10:00:00Z'),updatedAt:'2026-02-01',metrics:{commits:{kind:'event',value:999,points:[{date:'2026-01-03',value:10}]}}};
+ const recent=repo('zeta','2026-01-02T10:00:00Z');
+ assert.deepEqual([old,recent].sort(compareRepositories).map(r=>r.name),['zeta','alpha']);
+ assert.deepEqual([repo('zeta',null),repo('alpha',null)].sort(compareRepositories).map(r=>r.name),['alpha','zeta']);
+ const fallback={name:'fallback',metrics:{commits:{kind:'event',value:99,lastSuccess:'2026-02-01',points:[{date:'2026-01-01',value:2},{date:'2026-01-03',value:0}]},stars:{kind:'balance',points:[{date:'2026-01-03',value:999}]}}};
+ assert.equal(repositoryActivity(fallback),Date.parse('2026-01-01'));
+ assert.equal(repositoryActivity({metrics:{stars:fallback.metrics.stars}}),0);
+ assert.equal(repositoryActivity({metrics:{views:{kind:'event',points:[{date:'2026-02-01',value:100}]},clones:{kind:'event',points:[{date:'2026-02-01',value:5}]}}}),0,'traffic counters are not recorded GitHub events');
+ assert.equal(repositoryActivity({...fallback,lastActivityAt:null}),0,'an explicit no-activity result is authoritative');
+ assert.equal(repositoryActivity(presentRepository({metrics:{stars:fallback.metrics.stars,star_activity:{kind:'event',points:[{date:'2026-01-02',value:1}]}}})),Date.parse('2026-01-02'));
+ assert.deepEqual([old,recent].sort((a,b)=>compareRepositories(a,b,'name')).map(r=>r.name),['alpha','zeta']);
+});
+test('row preferences are independent, permit no metrics, and reject duplicates or unsafe keys',()=>{
+ assert.deepEqual(validateRowKeys(['stars','commits']),['stars','commits']);assert.deepEqual(validateRowKeys([]),[]);
+ for(const value of [null,{},['stars','stars'],['star_activity'],['<script>']])assert.equal(validateRowKeys(value),null);
+});
 test('metric actions use safe repository destinations and honest date semantics',()=>{
  const r={url:'https://github.com/northstar-labs/atlas-api'};
  const action=k=>new URL(githubMetricAction(r,k,dates).url);

@@ -21,6 +21,73 @@ const safe = (message, statusCode = 400, code = 'invalid') => Object.assign(new 
 const isoDay = date => new Date(date).toISOString().slice(0, 10);
 const text = (value, max = 200) => typeof value === 'string' ? value.replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, max) : null;
 const nonnegative = n => Number.isSafeInteger(n) && n >= 0;
+// Only standalone, matching fences close a block; unfinished blocks fail closed.
+function withoutFences(value) {
+  const lines = [];
+  let fence;
+  for (const line of value.split(/\r\n?|\n/)) {
+    if (fence) {
+      const close = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(line);
+      if (close && close[1][0] === fence[0] && close[1].length >= fence.length) fence = undefined;
+      continue;
+    }
+    const open = /^ {0,3}(`{3,}|~{3,})/.exec(line);
+    if (open) { fence = open[1]; continue; }
+    lines.push(line);
+  }
+  return lines.join('\n');
+}
+const EMAIL = /[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i;
+const UNSAFE_TEXT = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069]/;
+// Recognizable statements are not prose; inline names such as `parseConfig` are.
+const codeStatement = value => /^(?:(?:const|let|var)\s+[\w$]+\s*[:=;]|(?:export\s+)?(?:async\s+)?function\b.*\{|class\b.*\{|(?:import|from)\s+.*(?:['"]|\bimport\b)|(?:if|for|while)\s*\(.*\{|[\w$.]+\s*=(?!=).*;\s*$)/.test(value.trim());
+const inlineSnippet = value => codeStatement(value) || /^(?:[\w$.]+\s*=(?!=)|[\w$.]+\s*\(\s*[^\s)].*\)\s*;?$)/.test(value.trim());
+function descriptiveText(value, max) {
+  return value.replace(/(`+)([^`]*?)\1/g, (_, delimiters, content) => inlineSnippet(content) ? ' ' : content)
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/\[[^\]]*\]\([^)]*\)/g, match => match.slice(1, match.indexOf(']')))
+    .replace(new RegExp(EMAIL, 'gi'), '[redacted]')
+    .replace(new RegExp(UNSAFE_TEXT, 'g'), ' ')
+    .replace(/\s+/g, ' ').trim().slice(0, max) || undefined;
+}
+// Titles/names are one-line metadata, not Markdown blocks or diff lines.
+function oneLine(value, max = 200) {
+  if (typeof value !== 'string') return undefined;
+  const line = value.slice(0, 32_000).split(/\r\n?|\n/, 1)[0].trim();
+  return /^(?:`{3,}|~{3,})/.test(line) || codeStatement(line) ? undefined : descriptiveText(line, max);
+}
+// Git refs are identifiers, never prose: retain exact validated input or omit it.
+function refName(value) {
+  if (typeof value !== 'string' || !value.length || value.length > 255 || value === '@' || value.startsWith('-') || value.endsWith('.') || value.includes('..') || value.includes('@{') || /[\s~^:?*\[\\<>]/.test(value) || UNSAFE_TEXT.test(value) || EMAIL.test(value)) return undefined;
+  return value.split('/').some(part => !part || part.startsWith('.') || part.endsWith('.lock')) ? undefined : value;
+}
+// Descriptions retain ordinary bullet text, never structural code/diff blocks.
+function prose(value, max = 500) {
+  if (typeof value !== 'string') return undefined;
+  const lines = withoutFences(value.slice(0, 32_000)).split('\n'), kept = [];
+  let diff = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^(?:diff --git(?: |$)|@@(?: |$))/.test(line) || (/^--- /.test(line) && /^\+\+\+ /.test(lines[i + 1] ?? ''))) diff = true;
+    if (diff) {
+      if (/^(?:diff --git|index |[ +\-@\\]|(?:new|deleted) file mode |(?:old|new) mode |(?:similarity|dissimilarity) index |(?:rename|copy) (?:from|to) |Binary files |GIT binary patch)/.test(line)) continue;
+      diff = false;
+    }
+    if (/^(?: {4}|\t)/.test(line) || codeStatement(line)) continue;
+    kept.push(line.replace(/^ {0,3}[-+*] +/, ''));
+  }
+  return descriptiveText(kept.join('\n'), max);
+}
+function actorOf(user, name) {
+  const login = typeof user?.login === 'string' && /^[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:\[bot\])?$/.test(user.login) ? user.login : undefined;
+  const display = oneLine(name ?? user?.name, 100);
+  return login || display ? { ...(login ? { login, url: `https://github.com/${encodeURIComponent(login)}` } : {}), ...(display ? { name: display } : {}) } : undefined;
+}
+const timestamp = value => dateOf(value) && value.includes('T') ? new Date(value).toISOString() : null;
+function descriptive(user, name, summary, metadata, date, source) {
+  const actor = actorOf(user, name);
+  return { actor, author: actor?.login ?? actor?.name ?? null, summary: prose(summary), metadata, date: timestamp(date), source };
+}
 function dateOf(value) {
   if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))?$/.test(value)) return null;
   const day = value.slice(0, 10);
@@ -137,7 +204,22 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
       CREATE INDEX IF NOT EXISTS issue_detail_scope ON issue_records(repo_id,day DESC,number);
       CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS budgets (identity TEXT PRIMARY KEY, remaining INTEGER NOT NULL, reset_at INTEGER NOT NULL, blocked_until INTEGER NOT NULL DEFAULT 0);
-      PRAGMA user_version=1;`);
+      CREATE TABLE IF NOT EXISTS event_context (
+        event_id TEXT PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE,
+        occurred_at TEXT, observed_at TEXT, source TEXT NOT NULL, context TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS event_context_time ON event_context(occurred_at DESC,event_id);
+      CREATE TABLE IF NOT EXISTS activity_feed (
+        id TEXT PRIMARY KEY, repo_id TEXT NOT NULL REFERENCES repositories(id), type TEXT NOT NULL,
+        day TEXT NOT NULL, title TEXT NOT NULL, url TEXT NOT NULL, author TEXT,
+        occurred_at TEXT NOT NULL, observed_at TEXT NOT NULL, source TEXT NOT NULL, context TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS activity_feed_scope ON activity_feed(repo_id,type,day DESC,id);
+      CREATE VIEW IF NOT EXISTS activity_records AS
+        SELECT events.*,event_context.occurred_at,event_context.observed_at,event_context.source,event_context.context
+        FROM events LEFT JOIN event_context ON events.id=event_context.event_id
+        UNION ALL SELECT * FROM activity_feed WHERE NOT EXISTS (SELECT 1 FROM events WHERE events.id=activity_feed.id);
+      PRAGMA user_version=2;`);
     // Include recovery in initialization cleanup: a failed UPDATE must not leak
     // either database handle or the lifetime writer lock.
     db.prepare("UPDATE runs SET status='interrupted', message='Collection interrupted; previous observations retained.' WHERE status='collecting'").run();
@@ -214,7 +296,7 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
         throw safe('GitHub rate limit reached; waiting for reset.', 429, 'rate_limited');
       }
       if (response.status >= 300 && response.status < 400) { await response.body?.cancel().catch(() => {}); throw safe('GitHub redirect refused.', 502, 'redirect_refused'); }
-      if (response.status < 200 || response.status >= 300) {
+      if ((response.status < 200 || response.status >= 300) && response.status !== 409) {
         await response.body?.cancel().catch(() => {});
         const code = response.status === 404 ? 'unsupported' : response.status === 401 ? 'unauthorized' : response.status === 403 ? 'forbidden' : 'upstream_error';
         throw safe(code === 'unsupported' ? 'Endpoint unavailable or repository not accessible.' : code === 'unauthorized' ? 'GitHub credentials were rejected.' : code === 'forbidden' ? 'Endpoint permission unavailable.' : 'GitHub endpoint failed.', response.status === 401 ? 401 : 502, code);
@@ -238,7 +320,8 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
       } else throw safe('Invalid GitHub response stream.', 502, 'invalid_response');
       let data;
       try { data = JSON.parse(raw); } catch { throw safe('Invalid GitHub response.', 502, 'invalid_response'); }
-      return { data, link: response.headers.get('link') || '' };
+      if (response.status === 409) throw safe(data?.message === 'Git Repository is empty.' ? 'Repository is empty; no commits are available yet.' : 'GitHub repository state conflicts with this request.', 409, data?.message === 'Git Repository is empty.' ? 'empty_repository' : 'conflict');
+      return { data, link: response.headers.get('link') || '', pollInterval: response.headers.get('x-poll-interval') };
     };
     try { return await Promise.race([task(), timeout]); }
     catch (error) { throw error.safeMessage ? error : safe('GitHub request failed.', 502, 'network_error'); }
@@ -299,7 +382,8 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
         metrics[key] = { label, kind, unit, value, observedAt:latest.observed_at, delta: kind === 'balance' && complete && dates.length > 1 ? points.at(-1).value - points[0].value : null, points,
           coverage: { start: observations[0]?.day ?? null, end: observations.at(-1)?.day ?? null, complete }, status: row.paused ? 'paused' : outcome?.status ?? 'not_collected', lastSuccess: outcome?.last_success ?? null, source };
       }
-      return { ...publicRepo(row), metrics };
+      const lastActivityAt = db.prepare('SELECT MAX(occurred_at) AS at FROM activity_records WHERE repo_id=? AND occurred_at<=?').get(row.id, clock().toISOString()).at;
+      return { ...publicRepo(row), metrics, ...(lastActivityAt ? { lastActivityAt } : {}) };
     });
     return { dates, repos, updatedAt: getState('updatedAt'), collecting: Boolean(flight), credentialConfigured: Boolean(token) };
   }
@@ -312,7 +396,41 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
   function events(limit = 100) {
     ensureOpen();
     if (!Number.isInteger(Number(limit)) || Number(limit) < 1) throw safe('Invalid event limit.');
-    return { events: db.prepare(`SELECT events.*,repositories.owner,repositories.name FROM events JOIN repositories ON repositories.id=events.repo_id ORDER BY day DESC,id LIMIT ?`).all(Math.min(Number(limit), 500)).map(row => ({ id: row.id, repository: `${row.owner}/${row.name}`, type: row.type, date: row.day, title: row.title, url: row.url, ...(row.author ? { author: row.author } : {}) })) };
+    return { events: activity({ limit: Math.min(Number(limit), 500) }).events };
+  }
+  function eventRecord(row) {
+    const context = Object.hasOwn(row, 'context') ? (row.context ? row : null) : db.prepare('SELECT * FROM event_context WHERE event_id=?').get(row.id);
+    const title = row.type === 'commits' && /^Commit [a-fA-F0-9]{1,64}$/.test(row.title) ? 'Commit (title unavailable)' : row.title;
+    return { id: row.id, repository: `${row.owner}/${row.name}`, repositoryId: row.repo_id, type: row.type, date: context?.occurred_at ?? row.day, title, url: row.url,
+      ...(row.author ? { author: row.author } : {}), ...(context ? { ...JSON.parse(context.context), source: context.source, ...(context.observed_at ? { observedAt: context.observed_at } : {}) } : {}) };
+  }
+  const coverage = () => ({ complete: false, label: 'Retained activity only, not full history. GitHub Events is capped at 300 events / 30 days and may lag 30 seconds–6 hours; collection pages, permissions and rate budgets can leave gaps.' });
+  function activity({ repository, range = 'all', offset = 0, limit = 100, visibility = 'all', search = '', archived } = {}) {
+    ensureOpen();
+    const integer = (value, min, max) => {
+      if (!['number', 'string'].includes(typeof value) || !/^(0|[1-9]\d*)$/.test(String(value)) || !Number.isSafeInteger(Number(value)) || Number(value) < min || Number(value) > max) throw safe('Invalid activity pagination.');
+      return Number(value);
+    };
+    offset = integer(offset, 0, Number.MAX_SAFE_INTEGER); limit = integer(limit, 1, 500);
+    if (!['string', 'number'].includes(typeof range) || !['7', '30', '90', 'all'].includes(String(range))) throw safe('Invalid range.');
+    if (!['all', 'public', 'private'].includes(visibility)) throw safe('Invalid visibility.');
+    if (typeof search !== 'string' || search.length > 200 || /[\u0000-\u001f\u007f-\u009f]/.test(search)) throw safe('Invalid search.');
+    if (archived !== undefined && ![true, false, 'true', 'false'].includes(archived)) throw safe('Invalid archive filter.');
+    const params = [], clauses = ['repositories.paused=0', 'a.day<=?'];
+    params.push(isoDay(clock()));
+    if (visibility !== 'all') { clauses.push('repositories.visibility=?'); params.push(visibility); }
+    if (archived !== undefined) { clauses.push('repositories.archived=?'); params.push(Number(archived === true || archived === 'true')); }
+    if (search.trim()) { clauses.push("instr(lower(repositories.owner || '/' || repositories.name),lower(?))>0"); params.push(search.trim()); }
+    if (repository !== undefined) {
+      if (typeof repository !== 'string' || !/^[1-9]\d*$/.test(repository)) throw safe('Invalid repository ID.');
+      if (!db.prepare('SELECT 1 FROM repositories WHERE id=? AND paused=0').get(repository)) throw safe('Watch not found.', 404);
+      clauses.push('a.repo_id=?'); params.push(repository);
+    }
+    if (String(range) !== 'all') { clauses.push('a.day>=?'); params.push(dateWindow(range).start); }
+    const scope = `FROM activity_records a JOIN repositories ON repositories.id=a.repo_id WHERE ${clauses.join(' AND ')}`;
+    const total = db.prepare(`SELECT COUNT(*) AS count ${scope}`).get(...params).count;
+    const records = db.prepare(`SELECT a.*,repositories.owner,repositories.name ${scope} ORDER BY COALESCE(a.occurred_at,a.day) DESC,a.id LIMIT ? OFFSET ?`).all(...params, limit, offset).map(eventRecord);
+    return { events: records, total, hasMore: offset < total - records.length, offset, limit, coverage: coverage() };
   }
   function details({ repository, metric, range = '30', offset = 0, limit = 50 } = {}) {
     ensureOpen();
@@ -334,7 +452,15 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
     if (['commits', 'merged_prs', 'releases'].includes(metric)) {
       result.kind = 'events';
       result.total = db.prepare('SELECT COUNT(*) AS count FROM events WHERE repo_id=? AND type=? AND day>=? AND day<=?').get(repository, metric, start, end).count;
-      result.items = db.prepare('SELECT id,day AS date,title,url,author FROM events WHERE repo_id=? AND type=? AND day>=? AND day<=? ORDER BY day DESC,id LIMIT ? OFFSET ?').all(repository, metric, start, end, limit, offset).map(({ author, ...item }) => ({ ...item, ...(author ? { author } : {}) }));
+      result.items = db.prepare('SELECT events.*,repositories.owner,repositories.name FROM events JOIN repositories ON repositories.id=events.repo_id LEFT JOIN event_context ON event_context.event_id=events.id WHERE repo_id=? AND type=? AND day>=? AND day<=? ORDER BY COALESCE(occurred_at,day) DESC,events.id LIMIT ? OFFSET ?').all(repository, metric, start, end, limit, offset).map(eventRecord);
+    } else if (['stars', 'forks'].includes(metric) && db.prepare('SELECT 1 FROM runs WHERE repo_id=? AND metric=?').get(repository, 'activity')) {
+      const feedRun = db.prepare('SELECT * FROM runs WHERE repo_id=? AND metric=?').get(repository, 'activity');
+      result.kind = 'events'; result.complete = false; result.coverage = coverage();
+      result.status = feedRun.status === 'ok' ? 'partial' : feedRun.status;
+      result.observedAt = db.prepare('SELECT MAX(observed_at) AS at FROM activity_feed WHERE repo_id=? AND type=?').get(repository, metric).at;
+      const lower = String(range) === 'all' ? '' : start;
+      result.total = db.prepare('SELECT COUNT(*) AS count FROM activity_feed WHERE repo_id=? AND type=? AND day>=? AND day<=?').get(repository, metric, lower, end).count;
+      result.items = db.prepare('SELECT a.*,repositories.owner,repositories.name FROM activity_feed a JOIN repositories ON repositories.id=a.repo_id WHERE repo_id=? AND type=? AND day>=? AND day<=? ORDER BY occurred_at DESC,a.id LIMIT ? OFFSET ?').all(repository, metric, lower, end, limit, offset).map(eventRecord);
     } else if (metric === 'issues') {
       const snapshot = db.prepare('SELECT * FROM issue_snapshots WHERE repo_id=?').get(repository);
       result.kind = 'snapshot';
@@ -374,6 +500,11 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
   });
   function incomplete(result) { if (!result.complete) throw safe('Pagination limit reached; previous observations retained.', 502, 'partial'); return result.items; }
   function endpointFailure(id, metric, error, at) { run(id, metric, error.code || 'error', at, error.safeMessage || 'Collection failed; previous observations retained.'); }
+  function storeEvent(id, metric, value, at) {
+    const key = `${id}:${metric}:${value.id}`;
+    db.prepare('INSERT OR REPLACE INTO events(id,repo_id,type,day,title,url,author) VALUES(?,?,?,?,?,?,?)').run(key, id, metric, value.day, value.title, value.url, value.author ?? null);
+    db.prepare('INSERT INTO event_context(event_id,occurred_at,observed_at,source,context) VALUES(?,?,?,?,?)').run(key, value.date ?? null, at, value.source ?? metric, JSON.stringify({ ...(value.actor ? { actor: value.actor } : {}), ...(value.summary ? { summary: value.summary } : {}), ...(value.metadata ? { metadata: value.metadata } : {}) }));
+  }
   function putEvents(id, metric, values, start, end, at) {
     const unique = new Map();
     for (const value of values) if (value.day >= start && value.day <= end) unique.set(value.id, value);
@@ -382,10 +513,120 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
     transaction(() => {
       // Exact complete coverage replaces this bounded window, including rebase/deletion corrections.
       db.prepare('DELETE FROM events WHERE repo_id=? AND type=? AND day>=? AND day<=?').run(id, metric, start, end);
-      for (const value of unique.values()) db.prepare('INSERT OR REPLACE INTO events(id,repo_id,type,day,title,url,author) VALUES(?,?,?,?,?,?,?)').run(`${id}:${metric}:${value.id}`, id, metric, value.day, value.title, value.url, value.author);
+      for (const value of unique.values()) storeEvent(id, metric, value, at);
       for (const [day, count] of counts) putPoint(id, metric, day, count, at);
       run(id, metric, 'ok', at, 'Complete bounded event coverage collected.'); setState('updatedAt', at);
     });
+  }
+  function feedEvent(item, row, web) {
+    const date = timestamp(item?.created_at);
+    if (!date || typeof item.id !== 'string' || !/^\d{1,40}$/.test(item.id) || typeof item.type !== 'string' || !/^[A-Z][A-Za-z]{0,60}Event$/.test(item.type) || (item.repo?.id !== undefined && String(item.repo.id) !== row.id)) throw safe('Invalid activity event.', 502, 'invalid_response');
+    const p = item.payload && typeof item.payload === 'object' ? item.payload : {};
+    const action = oneLine(p.action, 80);
+    const metadata = action ? { action } : {};
+    const actor = actorOf(item.actor);
+    let type = item.type.replace(/Event$/, '').replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase();
+    let id = `${row.id}:github_events:${item.id}`, title = type.replaceAll('_', ' '), url = web, summary;
+    const number = value => nonnegative(value) && value > 0;
+    const subject = p.pull_request ?? p.issue ?? p.discussion;
+    if (number(subject?.number ?? p.number)) {
+      metadata.number = subject?.number ?? p.number;
+      title = oneLine(subject?.title) || `${p.pull_request ? 'Pull request' : p.discussion ? 'Discussion' : 'Issue'} #${metadata.number}`;
+      url = `${web}/${p.pull_request || p.issue?.pull_request ? 'pull' : p.discussion ? 'discussions' : 'issues'}/${metadata.number}`;
+    }
+    switch (item.type) {
+      case 'WatchEvent': type = 'stars'; title = 'Starred repository'; break;
+      case 'ForkEvent': {
+        type = 'forks'; title = 'Forked repository';
+        try { const fork = repositoryName(`${p.forkee?.owner?.login}/${p.forkee?.name}`); url = `https://github.com/${fork.full}`; } catch {}
+        break;
+      }
+      case 'PushEvent':
+        type = 'pushes'; title = 'Pushed commits';
+        // Push time is not commit time. Keep one push, never fabricate commits
+        // from the (often absent/truncated) payload.commits array or fetch N SHAs.
+        if (refName(p.ref)) {
+          metadata.ref = p.ref;
+          if (p.ref.startsWith('refs/heads/')) metadata.branch = refName(p.ref.slice(11));
+          metadata.refType = p.ref.startsWith('refs/tags/') ? 'tag' : p.ref.startsWith('refs/heads/') ? 'branch' : undefined;
+        }
+        if (typeof p.head === 'string' && /^[a-fA-F0-9]{1,64}$/.test(p.head)) metadata.head = p.head;
+        if (nonnegative(p.size)) metadata.commitCount = p.size;
+        if (metadata.branch) title = `Pushed to ${metadata.branch}`;
+        break;
+      case 'PullRequestEvent':
+        type = 'pull_requests';
+        if ((p.action === 'merged' || (p.action === 'closed' && (p.pull_request?.merged === true || timestamp(p.pull_request?.merged_at)))) && number(metadata.number)) {
+          type = 'merged_prs'; id = `${row.id}:merged_prs:${metadata.number}`; metadata.action = 'merged';
+        }
+        for (const key of ['head', 'base']) if (refName(p.pull_request?.[key]?.ref)) metadata[key] = p.pull_request[key].ref;
+        summary = prose(p.pull_request?.body);
+        break;
+      case 'ReleaseEvent':
+        type = 'release_activity';
+        title = oneLine(p.release?.name) || refName(p.release?.tag_name) || 'Release activity';
+        if (refName(p.release?.tag_name)) { metadata.ref = p.release.tag_name; metadata.refType = 'tag'; }
+        url = `${web}/releases`;
+        if (metadata.ref) url += `/tag/${encodeURIComponent(metadata.ref)}`;
+        if (p.action === 'published' && number(p.release?.id) && p.release?.draft !== true) { type = 'releases'; id = `${row.id}:releases:${p.release.id}`; }
+        summary = prose(p.release?.body);
+        break;
+      case 'CreateEvent': case 'DeleteEvent':
+        type = item.type === 'CreateEvent' ? 'ref_created' : 'ref_deleted';
+        if (refName(p.ref)) metadata.ref = p.ref;
+        if (['branch', 'tag', 'repository'].includes(p.ref_type)) metadata.refType = p.ref_type;
+        title = `${item.type === 'CreateEvent' ? 'Created' : 'Deleted'} ${metadata.refType || 'reference'}${metadata.ref ? ` ${metadata.ref}` : ''}`;
+        break;
+      case 'PublicEvent': title = 'Made repository public'; break;
+      case 'GollumEvent': title = 'Updated wiki'; url = `${web}/wiki`; break;
+      case 'MemberEvent': title = 'Repository collaborator activity'; break;
+      case 'CommitCommentEvent':
+        title = 'Commit comment';
+        if (typeof p.comment?.commit_id === 'string' && /^[a-fA-F0-9]{1,64}$/.test(p.comment.commit_id)) { metadata.sha = p.comment.commit_id; url = `${web}/commit/${p.comment.commit_id}`; }
+        break;
+    }
+    return { id, type, day: date.slice(0, 10), title: title.slice(0, 200) || 'Repository activity', url, author: actor?.login ?? actor?.name ?? null, date, actor, summary, metadata };
+  }
+  async function collectFeed(row, route, web, context, at) {
+    const pollKey = 'activityPoll:' + row.id;
+    if (Number(getState(pollKey)) > clock().getTime()) {
+      const previous = getState('activityOutcome:' + row.id) || 'partial';
+      db.prepare('UPDATE runs SET status=?,message=? WHERE repo_id=? AND metric=?').run(previous, 'Waiting for GitHub polling interval; retained activity is incomplete.', row.id, 'activity');
+      return;
+    }
+    const cursorKey = 'activityPage:' + row.id;
+    let page = Number(getState(cursorKey) || 1);
+    if (![1, 2, 3].includes(page)) page = 1;
+    const allowance = Math.min(3, maxPages);
+    for (let count = 0; count < allowance && page <= 3; count++, page++) {
+      let response, values;
+      try {
+        response = await request(`${route}/events`, { per_page: 100, page }, row.access, context);
+        if (!Array.isArray(response.data) || response.data.length > 100) throw safe('Invalid activity page.', 502, 'invalid_response');
+        values = response.data.map(item => feedEvent(item, row, web));
+      } catch (error) {
+        // Resume budget deferrals, but do not let a permanently missing/invalid
+        // old page prevent refreshing the newest page on every future cycle.
+        if (!['rate_limited', 'budget_exhausted'].includes(error.code)) setState(cursorKey, '1');
+        throw error;
+      }
+      const more = /\brel\s*=\s*["']?next\b/i.test(response.link) || response.data.length === 100;
+      const partial = more;
+      transaction(() => {
+        for (const value of values) {
+          if (value.date > at) continue;
+          db.prepare(`INSERT INTO activity_feed(id,repo_id,type,day,title,url,author,occurred_at,observed_at,source,context) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(id) DO UPDATE SET title=excluded.title,url=excluded.url,author=excluded.author,context=excluded.context,observed_at=excluded.observed_at`).run(value.id, row.id, value.type, value.day, value.title, value.url, value.author, value.date, at, 'github_events', JSON.stringify({ ...(value.actor ? { actor: value.actor } : {}), ...(value.summary ? { summary: value.summary } : {}), metadata: value.metadata }));
+        }
+        setState(cursorKey, String(more && page < 3 ? page + 1 : 1));
+        const poll = Number(response.pollInterval);
+        if (Number.isFinite(poll) && poll > 0) setState(pollKey, String(clock().getTime() + Math.min(poll, 86400) * 1000));
+        setState('activityOutcome:' + row.id, partial ? 'partial' : 'ok');
+        run(row.id, 'activity', partial ? 'partial' : 'ok', at, partial ? 'Activity page/cap reached; retained records are incomplete.' : 'Available activity pages retained; provider history is capped and delayed.');
+        setState('updatedAt', at);
+      });
+      if (!more) break;
+    }
   }
   async function collect(row, context, at) {
     const start = isoDay(Date.parse(`${isoDay(at)}T00:00:00Z`) - 179 * DAY);
@@ -397,7 +638,7 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
       if (repo.id !== row.id || (row.access === 'public' && repo.visibility !== 'public')) throw safe('Repository identity or access changed.', 403, 'identity_changed');
       transaction(() => { storeRepository(repo, row.access, `${row.owner}/${row.name}`, at, false); setState('updatedAt', at); });
     } catch (error) {
-      transaction(() => { for (const metric of ['metadata', ...Object.keys(DEFINITIONS)]) endpointFailure(row.id, metric, error, at); });
+      transaction(() => { for (const metric of ['metadata', 'activity', ...Object.keys(DEFINITIONS)]) endpointFailure(row.id, metric, error, at); });
       return false;
     }
     const route = `/repos/${repo.full}`;
@@ -410,7 +651,8 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
       const values = items.map(item => {
         const day = dateOf(item.commit?.committer?.date);
         if (!day || typeof item.sha !== 'string' || !/^[a-fA-F0-9]{1,64}$/.test(item.sha)) throw safe('Invalid commit response.', 502, 'invalid_response');
-        return { id: item.sha, day, title: `Commit ${item.sha.slice(0, 7)}`, url: `${web}/commit/${item.sha}`, author: text(item.author?.login, 100) };
+        const [title, ...rest] = typeof item.commit?.message === 'string' ? item.commit.message.split(/\r?\n/) : [];
+        return { id: item.sha.toLowerCase(), day, title: oneLine(title) || 'Commit (title unavailable)', url: `${web}/commit/${item.sha.toLowerCase()}`, ...descriptive(item.author, item.commit?.author?.name, rest.join('\n'), { sha: item.sha.toLowerCase(), branch: refName(repo.branch) }, item.commit.committer.date, 'commits') };
       });
       putEvents(row.id, 'commits', values, start, end, at);
     });
@@ -422,7 +664,7 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
         if (!item.merged_at) continue;
         const day = dateOf(item.merged_at);
         if (!day || !nonnegative(item.number) || item.number < 1) throw safe('Invalid pull request response.', 502, 'invalid_response');
-        values.push({ id: String(item.number), day, title: text(item.title) || `Pull request #${item.number}`, url: `${web}/pull/${item.number}`, author: text(item.user?.login, 100) });
+        values.push({ id: String(item.number), day, title: oneLine(item.title) || `Pull request #${item.number}`, url: `${web}/pull/${item.number}`, ...descriptive(item.user, undefined, item.body, { number: item.number, action: 'merged', ...(refName(item.head?.ref) ? { head: item.head.ref } : {}), ...(refName(item.base?.ref) ? { base: item.base.ref } : {}) }, item.merged_at, 'pulls') });
       }
       putEvents(row.id, 'merged_prs', values, start, end, at);
     });
@@ -433,7 +675,9 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
         if (item.draft === true) continue;
         const day = dateOf(item.published_at);
         if (!day || !nonnegative(item.id) || item.id < 1 || typeof item.tag_name !== 'string' || !item.tag_name.length) throw safe('Invalid release response.', 502, 'invalid_response');
-        values.push({ id: String(item.id), day, title: text(item.name) || text(item.tag_name) || 'Release', url: `${web}/releases/tag/${encodeURIComponent(item.tag_name)}`, author: text(item.author?.login, 100) });
+        const ref = refName(item.tag_name);
+        const url = ref ? `${web}/releases/tag/${encodeURIComponent(ref)}` : `${web}/releases`;
+        values.push({ id: String(item.id), day, title: oneLine(item.name) || ref?.slice(0, 200) || 'Release', url, ...descriptive(item.author, undefined, item.body, { ref, refType: 'tag', action: 'published' }, item.published_at, 'releases') });
       }
       putEvents(row.id, 'releases', values, start, end, at);
     });
@@ -504,6 +748,7 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
         run(row.id, metric, 'ok', at, 'Provider daily buckets observed; omitted days remain unknown.'); setState('updatedAt', at);
       });
     });
+    perform('activity', () => collectFeed(row, route, web, context, at));
     const cursor=getState('familyCursor:'+row.id),pivot=Math.max(0,jobs.findIndex(job=>job.metric===cursor));
     const ordered=[...jobs.slice(pivot),...jobs.slice(0,pivot)];let deferred=null;
     for(const {metric,action} of ordered){
@@ -580,5 +825,5 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
     if (iso !== null && (typeof iso !== 'string' || !Number.isFinite(Date.parse(iso)))) throw safe('Invalid schedule.');
     nextRun = iso === null ? null : new Date(iso).toISOString();
   }
-  return { dashboard, status, events, details, discover, addWatch, sync, pauseWatch, backup, close, setNextRun };
+  return { dashboard, status, events, activity, details, discover, addWatch, sync, pauseWatch, backup, close, setNextRun };
 }

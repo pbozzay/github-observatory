@@ -64,3 +64,10 @@ test('watch mutation returns one repository wrapper',async t=>{
  const res=await fetch(base+'/api/watches',{method:'POST',headers:{Cookie:cookie,Origin:base,'Content-Type':'application/json','X-CSRF-Token':csrf},body:'{"repository":"example/repo","access":"public"}'});
  assert.equal(res.status,201);assert.equal((await res.json()).repository.id,'42');
 });
+
+test('empty repository conflicts retain HTTP 409 with a sanitized response',async t=>{
+ const {base,login,service}=await fixture(t);const {cookie,csrf}=await login();
+ service.addWatch=async()=>{throw Object.assign(new Error('Git Repository is empty. PRIVATE_ERROR'),{statusCode:409,code:'empty_repository'});};
+ const res=await fetch(base+'/api/watches',{method:'POST',headers:{Cookie:cookie,Origin:base,'Content-Type':'application/json','X-CSRF-Token':csrf},body:'{"repository":"example/repo","access":"public"}'});
+ assert.equal(res.status,409);assert.ok(!(await res.text()).includes('PRIVATE_ERROR'));
+});

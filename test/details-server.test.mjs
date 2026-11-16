@@ -21,7 +21,7 @@ async function fixture(t) {
     if (endpoint === 'commits') return Response.json([{ sha: 'abc123', commit: { committer: { date: '2026-06-19T00:00:00Z' } } }]);
     if (endpoint === 'traffic/views') return Response.json({ views: [] });
     if (endpoint === 'traffic/clones') return Response.json({ clones: [] });
-    assert.ok(['pulls', 'releases', 'stargazers/history'].includes(endpoint));
+    assert.ok(['pulls', 'releases', 'stargazers/history', 'events'].includes(endpoint));
     return Response.json([]);
   } });
   const details = service.details;
@@ -102,4 +102,28 @@ test('detail route rejects invalid and ambiguous parameters plus missing or paus
   response = await fetch(base + route, { headers: { Cookie: cookie } });
   assert.equal(response.status, 404);
   await response.text();
+});
+
+test('activity HTTP route is authenticated, paginated, persisted-only and validates canonical parameters', async t => {
+  const { base, login, service, counters } = await fixture(t);
+  const anonymous = await fetch(base + '/api/events');
+  assert.equal(anonymous.status, 401); await anonymous.text();
+  const cookie = await login(), headers = { Cookie: cookie }, before = counters().upstreamCalls;
+  const response = await fetch(base + '/api/events?repository=101&range=7&offset=0&limit=1', { headers });
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), service.activity({ repository: '101', range: '7', offset: 0, limit: 1 }));
+  for (const query of ['limit=500', 'range=all', 'visibility=public&search=sample&archived=false', '']) {
+    const good = await fetch(base + '/api/events?' + query, { headers });
+    assert.equal(good.status, 200); await good.text();
+  }
+  for (const query of ['repository=', 'repository=0101', 'range=', 'range=8', 'offset=-1', 'offset=01', 'offset=1e2', 'offset=', 'limit=', 'limit=501', 'limit=0', 'limit=1&limit=2', 'range=7&range=30', 'repository=101&repository=101', 'offset=0&offset=1', 'visibility=', 'archived=1', 'search=%00', 'search=a&search=b', 'visibility=all&visibility=public', 'archived=true&archived=false']) {
+    const bad = await fetch(base + '/api/events?' + query, { headers });
+    assert.equal(bad.status, 400, query); await bad.text();
+  }
+  assert.equal(counters().upstreamCalls, before);
+  service.pauseWatch('101');
+  const paused = await fetch(base + '/api/events?repository=101', { headers });
+  assert.equal(paused.status, 404); await paused.text();
+  const hidden = await fetch(base + '/api/events', { headers });
+  assert.equal((await hidden.json()).total, 0);
 });

@@ -3,8 +3,8 @@ import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 import {fileURLToPath} from 'node:url';
 import {chromium} from 'playwright';
-import {aggregate,chart,csvCell,githubURL} from '../public/metrics.js';
-import {DEMO_ORIGIN,DEMO_TIME,syntheticDashboard,syntheticDetails,installSyntheticDemo} from './synthetic-demo.mjs';
+import {aggregate,chart,csvCell,githubURL,CARD_METRICS} from '../public/metrics.js';
+import {DEMO_ORIGIN,DEMO_TIME,syntheticDashboard,syntheticDetails,syntheticEvents,installSyntheticDemo} from './synthetic-demo.mjs';
 
 // Synthetic API responses are confined to this test. No collector or GitHub call.
 const dates=['2025-01-01','2025-01-02','2025-01-03'];
@@ -31,7 +31,7 @@ test('frontend contract and responsive interactions',async t=>{
   t.after(()=>browser.close());
   const context=await browser.newContext({viewport:{width:1440,height:1000}});
   const page=await context.newPage();await page.clock.install();const errors=[];page.on('pageerror',error=>errors.push(error.message));
-  let authenticated=false,failDashboard=false,expired=false,dashboard=data();const calls=[];
+  let authenticated=false,failDashboard=false,failPause=false,expired=false,dashboard=data();const calls=[],retained=new Map();
   await context.route('**/*',async route=>{
     const request=route.request(),url=new URL(request.url());
     assert.equal(url.hostname,'observatory.test','No external requests permitted');
@@ -49,10 +49,10 @@ test('frontend contract and responsive interactions',async t=>{
       if(url.pathname==='/api/discover')return send({repositories:[{id:'owned',owner:'test-owner',name:'owned-repository',visibility:'private',archived:false,watched:calls.some(c=>c.path==='/api/watches'&&c.body?.access==='token')}]});
       if(url.pathname==='/api/watches'){
         const full=body.repository.replace('https://github.com/',''),[owner,name]=full.split('/');
-        const repository={id:name,owner,name,visibility:body.access==='token'?'private':'public',archived:false,language:null,description:null,url:'https://github.com/'+full,metrics:{}};
+        const repository=retained.get(full)||{id:name,owner,name,visibility:body.access==='token'?'private':'public',archived:false,language:null,description:null,url:'https://github.com/'+full,metrics:{}};
         dashboard.repos.push(repository);return send({repository});
       }
-      if(url.pathname.endsWith('/pause')){for(const m of Object.values(dashboard.repos.find(r=>r.id==='one').metrics))m.status='paused';return send({ok:true});}
+      if(url.pathname.endsWith('/pause')){if(failPause)return send({error:'Unavailable'},500);const repo=dashboard.repos.find(r=>r.id===url.pathname.split('/')[3]);retained.set(repo.owner+'/'+repo.name,repo);dashboard.repos=dashboard.repos.filter(r=>r.id!==repo.id);return send({ok:true});}
       if(url.pathname==='/api/sync')return send({started:true},202);
       if(url.pathname==='/api/events')return send({events:[{id:'event',repository:'test-owner/alpha',type:'commit',date:dates[2],title:'<script>bad()</script>',url:'https://evil.test/'}]});
       if(url.pathname==='/api/status')return send({collecting:false,credentialConfigured:true,lastAttempt:null,lastSuccess:null,runs:[{repository:'test-owner/alpha',metric:'commits',status:'error',lastAttempt:dates[2],lastSuccess:dates[0],message:'Collection failed'}]});
@@ -110,13 +110,30 @@ test('frontend contract and responsive interactions',async t=>{
     await page.click('[data-chart-mode="cumulative"]');assert.match(await page.locator('#detail .chart-explanation').first().textContent(),/Cumulative stars gained/);assert.match(await page.locator('#detail').textContent(),/selected range/);await page.click('#back');
     await page.reload();await page.waitForSelector('.project-card');assert.equal(await page.getAttribute('[data-chart-mode="cumulative"]','aria-pressed'),'true');
   });
-  await t.test('name sorting is the default and resets after reload',async()=>{
+  await t.test('recent activity is default and the selected sort persists',async()=>{
     const names=()=>page.locator('.project-name').allTextContents();
     assert.deepEqual(await names(),['alpha','beta','gamma']);
-    await page.click('#sort');assert.equal((await names())[0],'gamma');
+    assert.equal(await page.locator('#sort').textContent(),'Sort: recent activity ↓');
+    await page.click('#sort');assert.equal((await names())[0],'alpha');
     await page.reload();await page.waitForSelector('.project-card');
     assert.equal(await page.locator('#sort').textContent(),'Sort: name');
     assert.deepEqual(await names(),['alpha','beta','gamma']);
+    await page.click('#sort');
+  });
+  await t.test('repository cog focuses independent row settings and persists selections',async()=>{
+    await page.locator('#repository-settings').focus();await page.keyboard.press('Enter');
+    assert.equal(await page.evaluate(()=>document.activeElement.id),'repository-graphs');
+    assert.equal(await page.inputValue('#repository-sort'),'activity');
+    const cards=await page.locator('[data-card-setting]').evaluateAll(es=>es.map(e=>e.value));
+    await page.uncheck('[data-row-setting="views"]');await page.selectOption('#repository-sort','name');
+    await page.click('#preferences-form button[type="submit"]');await page.keyboard.press('Escape');
+    assert.equal(await page.locator('[data-project="one"] [data-metric="views"]').count(),0);
+    assert.equal(await page.locator('[data-aggregate="views"]').count(),1);
+    await page.reload();await page.waitForSelector('.project-card');assert.equal(await page.locator('#sort').textContent(),'Sort: name');
+    await page.click('#repository-settings');assert.equal(await page.isChecked('[data-row-setting="views"]'),false);
+    assert.deepEqual(await page.locator('[data-card-setting]').evaluateAll(es=>es.map(e=>e.value)),cards);
+    await page.check('#row-all');await page.selectOption('#repository-sort','activity');await page.click('#preferences-form button[type="submit"]');await page.keyboard.press('Escape');
+    assert.equal(await page.locator('[data-project="one"] [data-metric="views"]').count(),1);
   });
   await t.test('issue colors and saved settings thresholds update rows and survive reload',async()=>{
     const warning=page.locator('[data-project="one"] [data-metric="issues"]');
@@ -175,7 +192,15 @@ test('frontend contract and responsive interactions',async t=>{
     await page.fill('#repository','https://github.com/test-owner/public-repository');await page.click('#watch-form button');await page.waitForFunction(()=>document.querySelector('#dialog-message').textContent==='Public watch added.');
     assert.ok(calls.some(c=>c.path==='/api/watches'&&c.body.access==='public'));
     await page.keyboard.press('Escape');assert.equal(await page.evaluate(()=>document.activeElement.id),'settings');
-    await page.click('[data-project="one"] .project-name');await page.click('#pause');await page.click('#confirm-pause');await page.waitForSelector('#dialog',{state:'hidden'});assert.ok(calls.some(c=>c.path==='/api/watches/one/pause'));await page.click('#back');
+    await page.click('[data-project="one"] [data-unwatch]');await page.click('#cancel-unwatch');assert.equal(await page.locator('[data-project="one"]').count(),1);
+    failPause=true;await page.click('[data-project="one"] [data-unwatch]');await page.click('#confirm-pause');await page.waitForFunction(()=>document.querySelector('#dialog-message').textContent.includes('could not be completed'));assert.equal(await page.locator('[data-project="one"]').count(),1);await page.click('#cancel-unwatch');failPause=false;
+    await page.click('[data-project="one"] [data-unwatch]');assert.match(await page.locator('#dialog-body').textContent(),/stop collection.*active view.*history/i);await page.click('#confirm-pause');await page.waitForSelector('#dialog',{state:'hidden'});assert.ok(calls.some(c=>c.path==='/api/watches/one/pause'));
+    assert.equal(await page.locator('[data-project="one"]').count(),0);assert.match(await page.locator('#toast').textContent(),/Unwatched.*history is retained/);
+    await page.click('#settings');assert.equal(await page.locator('[data-watched="one"]').count(),0);assert.equal(await page.locator('[data-watched="two"] [data-unwatch]').count(),1);await page.keyboard.press('Escape');
+    const history=JSON.stringify(retained.get('test-owner/alpha').metrics);
+    await page.click('#settings');await page.fill('#repository','test-owner/alpha');await page.click('#watch-form button');await page.waitForFunction(()=>document.querySelector('#dialog-message').textContent==='Public watch added.');
+    assert.equal(await page.locator('[data-watched="one"]').count(),1);await page.keyboard.press('Escape');await page.waitForSelector('[data-project="one"]');assert.equal(JSON.stringify(dashboard.repos.find(r=>r.id==='one').metrics),history);
+    await page.click('#settings');await page.click('[data-watched="two"] [data-unwatch]');assert.match(await page.locator('#dialog-body').textContent(),/test-owner\/beta/);await page.click('#cancel-unwatch');assert.equal(await page.locator('[data-project="two"]').count(),1);
   });
   await t.test('activity and collection retrieve persisted endpoints safely',async()=>{
     await page.click('[data-page="activity"]');await page.waitForSelector('.event');assert.match(await page.locator('#events').textContent(),/<script>bad\(\)<\/script>/);assert.equal(await page.locator('#events a').count(),0);
@@ -210,6 +235,222 @@ test('frontend contract and responsive interactions',async t=>{
   });
 });
 
+test('rich Activity, filters, paging, refresh isolation and Logs',async t=>{
+  const browser=await chromium.launch({headless:true,...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE?{executablePath:process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE}:{})});t.after(()=>browser.close());
+  const context=await browser.newContext({viewport:{width:1440,height:1000},timezoneId:'UTC',serviceWorkers:'block'}),page=await context.newPage();await page.clock.install({time:new Date(DEMO_TIME)});page.setDefaultTimeout(6000);
+  const errors=[];page.on('pageerror',e=>errors.push(e.message));const dashboard=syntheticDashboard();
+  dashboard.repos[1].lastActivityAt='2026-04-30T15:00:00Z';dashboard.repos[0].lastActivityAt='2026-04-29T15:00:00Z';
+  let mode='normal',pending=[];
+  const harness=await installSyntheticDemo(context,{dashboard,api:async({url,send})=>{
+    if(url.pathname!=='/api/events')return false;
+    const data=syntheticEvents(url,dashboard,mode==='large'?163:63);
+    if(mode==='slow'){await new Promise(resolve=>pending.push(async()=>{try{await send({...data,events:data.events.map(e=>({...e,title:'LATE ACTIVITY MUST NOT APPEAR'}))});}catch{}resolve();}));return true;}
+    if(mode==='error')await send({error:'sensitive event error'},500);
+    else if(mode==='invalid')await send({...data,events:[],hasMore:true});
+    else if(mode==='duplicate')await send({...data,events:data.events.map((event,i)=>i===0?{...event,id:'demo-event-0'}:event)});
+    else if(mode==='changed')await send({...data,total:data.total+1,hasMore:true});
+    else if(mode==='unsafe')await send({...data,events:[{...data.events[0],title:'<img src=x onerror=alert(1)>',summary:'<script>bad()</script>',url:'javascript:alert(1)',actor:{login:'<b>actor</b>',url:'https://github.com.evil.test/'},metadata:{branch:'<img src=x>',sha:'abc123'}}],total:1,hasMore:false});
+    else await send(data);return true;
+  }});
+  const loaded=()=>page.waitForFunction(()=>document.querySelector('#activity').getAttribute('aria-busy')==='false');
+  await page.goto(DEMO_ORIGIN);await page.waitForSelector('.project-card');
+  assert.equal(await page.locator('.project-card').first().getAttribute('data-project'),'orbit');
+  await t.test('rich cards use descriptive titles, linked actors and secondary metadata',async()=>{
+    await page.click('[data-page="activity"]');await loaded();assert.equal(await page.locator('#events .event').count(),50);
+    const first=page.locator('#events .event').first();assert.match(await first.locator('h2').textContent(),/Preserve focus/);
+    assert.equal(await first.locator('.event-actor a').getAttribute('href'),'https://github.com/demo-avery');
+    assert.match(await first.textContent(),/Demo Avery.*demo-avery/);assert.match(await first.locator('.event-summary').textContent(),/missing observations/);
+    assert.match(await first.locator('.event-metadata').textContent(),/SHA.*abc123def456.*Branch.*main/);
+    assert.match(await page.locator('#events .event').nth(1).textContent(),/PR.*#81.*Action.*merged.*Head.*focus-fix.*Base.*main/);
+    assert.match(await page.locator('#events .event').nth(3).textContent(),/Actor not recorded/);
+    assert.match(await page.locator('#events-state').textContent(),/not a complete GitHub history/);
+    assert.deepEqual(harness.calls.filter(c=>c.path==='/api/events').at(-1).query,{limit:'50',offset:'0',range:'30'});
+  });
+  await t.test('paging and refresh failures keep rows, malformed pages fail safely',async()=>{
+    mode='error';await page.click('#events-more');await loaded();assert.equal(await page.locator('#events .event').count(),50);assert.match(await page.locator('#events-state').textContent(),/unchanged/);
+    mode='normal';await page.click('#events-more');await loaded();assert.equal(await page.locator('#events .event').count(),63);assert.equal(await page.isVisible('#events-more'),false);
+    mode='error';await page.click('#reload-events');await loaded();assert.equal(await page.locator('#events .event').count(),63);assert.doesNotMatch(await page.locator('#activity').textContent(),/sensitive event error/);
+    mode='invalid';await page.click('#reload-events');await loaded();assert.equal(await page.locator('#events .event').count(),63);
+    mode='normal';await page.click('#reload-events');await loaded();assert.equal(await page.locator('#events .event').count(),50);
+  });
+  await t.test('duplicate or changed pages stop pagination without corrupting rows',async()=>{
+    for(const failure of ['duplicate','changed']){
+      mode=failure;await page.click('#events-more');await loaded();
+      assert.equal(await page.locator('#events .event').count(),50);assert.match(await page.locator('#events-state').textContent(),/changed while paging/);assert.equal(await page.isVisible('#events-more'),false);
+      for(const refreshFailure of ['error','invalid']){
+        mode=refreshFailure;await page.click('#reload-events');await loaded();
+        assert.equal(await page.locator('#events .event').count(),50);
+        assert.match(await page.locator('#events-state').textContent(),/changed while paging/,'failed replacement cannot discard the inventory safety lock');
+        assert.match(await page.locator('#events-state').textContent(),/could not be loaded/);
+        assert.equal(await page.isVisible('#events-more'),false);
+        const before=harness.calls.filter(c=>c.path==='/api/events').length;
+        await page.locator('#events-more').dispatchEvent('click');
+        assert.equal(harness.calls.filter(c=>c.path==='/api/events').length,before,'even a stale click cannot page an inconsistent inventory');
+      }
+      mode='normal';await page.click('#reload-events');await loaded();assert.equal(await page.isVisible('#events-more'),true);
+      assert.doesNotMatch(await page.locator('#events-state').textContent(),/changed while paging|could not be loaded/);
+    }
+    mode='error';await page.click('#reload-events');await loaded();mode='normal';await page.click('#events-more');await loaded();
+    assert.equal(harness.calls.filter(c=>c.path==='/api/events').at(-1).query.offset,'50');assert.equal(await page.locator('#events .event').count(),63);
+    const before=harness.calls.filter(c=>c.path==='/api/events').length;await page.clock.fastForward(30001);await page.waitForTimeout(50);
+    assert.equal(await page.locator('#events .event').count(),63);assert.equal(harness.calls.filter(c=>c.path==='/api/events').length,before,'polling must not collapse a paged inventory');
+  });
+  await t.test('multi-repository filters run before pagination and report scoped totals',async()=>{
+    mode='large';await page.selectOption('#scope-filter','public');await loaded();
+    const q=harness.calls.filter(c=>c.path==='/api/events').at(-1).query;assert.equal(q.visibility,'public');assert.equal(q.repository,undefined);
+    const expected=syntheticEvents(new URL('/api/events?visibility=public',DEMO_ORIGIN),dashboard,163);
+    assert.equal(await page.locator('#events .event').count(),50);
+    await page.click('#events-more');await loaded();await page.click('#events-more');await loaded();
+    assert.equal(await page.locator('#events .event').count(),expected.total);assert.match(await page.locator('#events-state').textContent(),new RegExp(`of ${expected.total} stored events`));
+    assert.doesNotMatch(await page.locator('#events').textContent(),/cedar-studio/);
+    mode='normal';await page.selectOption('#scope-filter','all');await loaded();await page.fill('#search','-');await loaded();
+    assert.equal(harness.calls.filter(c=>c.path==='/api/events').at(-1).query.search,'-');assert.equal(await page.locator('#events .event').count(),50);
+    await page.click('#events-more');await loaded();assert.equal(await page.locator('#events .event').count(),63);
+    await page.fill('#search','');await loaded();
+    dashboard.repos[0].archived=true;dashboard.repos[2].archived=true;await page.clock.fastForward(30001);
+    await page.waitForFunction(()=>document.querySelectorAll('.project-card .archived').length===2);
+    await page.check('#archived');await loaded();assert.equal(harness.calls.filter(c=>c.path==='/api/events').at(-1).query.archived,'true');
+    assert.equal(await page.locator('#events .event').count(),syntheticEvents(new URL('/api/events?archived=true',DEMO_ORIGIN),dashboard).total);
+    await page.uncheck('#archived');await loaded();assert.equal(harness.calls.filter(c=>c.path==='/api/events').at(-1).query.archived,undefined);
+    assert.equal(await page.getAttribute('#search','maxlength'),'200');
+  });
+  await t.test('visible filters match repositories, date range, empty scope and safe markup',async()=>{
+    await page.fill('#search','atlas');await loaded();assert.equal(harness.calls.filter(c=>c.path==='/api/events').at(-1).query.repository,'atlas');assert.equal(await page.locator('#events .event').count(),16);
+    await page.click('[data-range="7"]');await page.waitForFunction(()=>document.querySelector('[data-range="7"]').getAttribute('aria-pressed')==='true');await loaded();assert.equal(harness.calls.filter(c=>c.path==='/api/events').at(-1).query.range,'7');
+    await page.selectOption('#scope-filter','private');await loaded();assert.equal(await page.locator('#events .event').count(),0);assert.match(await page.locator('#events-state').textContent(),/No matching repositories/);
+    await page.fill('#search','');await loaded();assert.equal(harness.calls.filter(c=>c.path==='/api/events').at(-1).query.repository,'orbit');
+    await page.selectOption('#scope-filter','all');await loaded();mode='unsafe';await page.click('#reload-events');await loaded();assert.match(await page.locator('#events').textContent(),/<img src=x/);assert.equal(await page.locator('#events a,#events img,#events script,#events b').count(),0);
+    for(const width of [390,320]){await page.setViewportSize({width,height:800});assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));}
+    await page.setViewportSize({width:1440,height:1000});mode='normal';
+  });
+  await t.test('late pages cannot cross filter, navigation or lock boundaries',async()=>{
+    mode='slow';await page.click('#reload-events');await page.waitForFunction(()=>document.querySelector('#activity').getAttribute('aria-busy')==='true');
+    mode='normal';await page.fill('#search','atlas');await loaded();for(const finish of pending.splice(0))await finish();assert.doesNotMatch(await page.locator('#events').textContent(),/LATE ACTIVITY/);
+    mode='slow';await page.click('#reload-events');await page.waitForFunction(()=>document.querySelector('#activity').getAttribute('aria-busy')==='true');await page.click('[data-page="collection"]');for(const finish of pending.splice(0))await finish();assert.equal(await page.locator('#page-title').textContent(),'Logs');assert.equal(await page.locator('[data-page="collection"]').textContent(),'Logs');
+    mode='normal';await page.click('[data-page="activity"]');await loaded();assert.doesNotMatch(await page.locator('#events').textContent(),/LATE ACTIVITY/);
+    mode='slow';await page.click('#reload-events');await page.waitForFunction(()=>document.querySelector('#activity').getAttribute('aria-busy')==='true');await context.route('**/api/dashboard?*',route=>route.fulfill({status:401,contentType:'application/json',body:'{}'}));await page.clock.fastForward(30001);await page.waitForSelector('#locked');for(const finish of pending.splice(0))await finish();assert.equal(await page.locator('#events').textContent(),'');assert.equal(await page.locator('#events-state').textContent(),'');
+    assert.deepEqual(errors,[]);assert.deepEqual(harness.blocked,[]);
+  });
+});
+
+test('Activity accepts bounded legacy inventories without weakening modern page limits',async t=>{
+  const browser=await chromium.launch({headless:true,...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE?{executablePath:process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE}:{})});t.after(()=>browser.close());
+  for(const sample of [
+    {name:'legacy empty',count:0,legacy:true,valid:true},
+    {name:'legacy 63 records',count:63,legacy:true,valid:true},
+    {name:'legacy 500-record bound',count:500,legacy:true,valid:true},
+    {name:'legacy over bound',count:501,legacy:true,valid:false},
+    {name:'legacy repeated IDs',count:63,legacy:true,duplicate:true,valid:false},
+    {name:'modern 50-record page',count:50,valid:true},
+    {name:'modern oversized page',count:51,valid:false},
+    {name:'modern cannot claim legacy to bypass bound',count:63,spoofLegacy:true,valid:false}
+  ])await t.test(sample.name,async t=>{
+    const context=await browser.newContext({serviceWorkers:'block'});t.after(()=>context.close());
+    const page=await context.newPage();await page.clock.install({time:new Date(DEMO_TIME)});
+    const dashboard=syntheticDashboard();
+    const harness=await installSyntheticDemo(context,{dashboard,api:async({url,send})=>{
+      if(url.pathname!=='/api/events')return false;
+      const event=syntheticEvents(url,dashboard).events[0],events=Array.from({length:sample.count},(_,i)=>({...event,id:'bounded-'+(sample.duplicate?0:i)}));
+      await send(sample.legacy?{events}:{events,total:events.length,hasMore:false,offset:0,limit:50,...(sample.spoofLegacy?{legacy:true}:{})});return true;
+    }});
+    await page.goto(DEMO_ORIGIN);await page.waitForSelector('.project-card');await page.click('[data-page="activity"]');
+    await page.waitForFunction(()=>document.querySelector('#activity').getAttribute('aria-busy')==='false');
+    assert.equal(await page.locator('#events .event').count(),sample.valid?sample.count:0);
+    const message=await page.locator('#events-state').textContent();
+    if(sample.valid){
+      assert.match(message,new RegExp(`Showing ${sample.count} of ${sample.count} stored events`));
+      if(sample.legacy)assert.match(message,/Pagination is unavailable.*additional history may exist/);
+      else assert.doesNotMatch(message,/older response/);
+    }else assert.match(message,/could not be loaded/);
+    assert.equal(await page.isVisible('#events-more'),false);
+    assert.deepEqual(harness.calls.filter(c=>c.path==='/api/events').at(-1).query,{limit:'50',offset:'0',range:'30'});
+    assert.deepEqual(harness.blocked,[]);
+  });
+});
+
+test('repository settings retain supported but unobserved row choices',async t=>{
+  const browser=await chromium.launch({headless:true,...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE?{executablePath:process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE}:{})});t.after(()=>browser.close());
+  const context=await browser.newContext({serviceWorkers:'block'}),page=await context.newPage();await page.clock.install({time:new Date(DEMO_TIME)});
+  const dashboard=syntheticDashboard(),clones=dashboard.repos[0].metrics.clones;
+  for(const repo of dashboard.repos)delete repo.metrics.clones;
+  const harness=await installSyntheticDemo(context,{dashboard});
+  const reopen=async()=>{await page.reload();await page.waitForSelector('.project-card');await page.click('#repository-settings');};
+  const save=async()=>{await page.click('#preferences-form button[type="submit"]');await page.keyboard.press('Escape');};
+  await page.goto(DEMO_ORIGIN);await page.waitForSelector('.project-card');await page.click('#repository-settings');
+  assert.deepEqual(await page.locator('[data-row-setting]').evaluateAll(es=>es.map(e=>e.dataset.rowSetting).sort()),Object.keys(CARD_METRICS).sort());
+  assert.equal(await page.isChecked('[data-row-setting="clones"]'),true);
+  await page.uncheck('[data-row-setting="views"]');await save();
+  assert.equal(await page.locator('#cards [data-metric="clones"]').count(),0,'unobserved graph stays hidden');
+  const saved=await page.evaluate(()=>JSON.parse(localStorage.getItem('github-observatory-preferences')));
+  assert.ok(saved.rowKeys.includes('clones'));assert.ok(!saved.rowKeys.includes('views'));
+  await reopen();assert.equal(await page.isChecked('[data-row-setting="clones"]'),true);await page.keyboard.press('Escape');
+  dashboard.repos[0].metrics.clones=clones;
+  await page.reload();await page.waitForSelector('[data-project="atlas"] [data-metric="clones"]');
+  assert.equal(await page.locator('#cards [data-metric="views"]').count(),0);
+  delete dashboard.repos[0].metrics.clones;await reopen();
+  assert.equal(await page.isChecked('[data-row-setting="clones"]'),true,'selection survives missing observations');
+  await page.uncheck('[data-row-setting="clones"]');await save();
+  dashboard.repos[0].metrics.clones=clones;await reopen();
+  assert.equal(await page.isChecked('[data-row-setting="clones"]'),false,'explicit deselection survives observations returning');
+  assert.equal(await page.locator('#cards [data-metric="clones"]').count(),0);
+  assert.deepEqual(harness.blocked,[]);
+});
+
+test('dialog mutations belong only to their originating dialog session',async t=>{
+  const browser=await chromium.launch({headless:true,...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE?{executablePath:process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE}:{})});t.after(()=>browser.close());
+  for(const operation of ['unwatch','public-watch','discover','owned-watch'])for(const failure of [false,true]){
+    await t.test(`${operation}: delayed ${failure?'failure':'success'} cannot mutate a replacement dialog`,async t=>{
+      const context=await browser.newContext({serviceWorkers:'block'});t.after(()=>context.close());
+      const page=await context.newPage();page.setDefaultTimeout(6000);await page.clock.install({time:new Date(DEMO_TIME)});
+      const errors=[];page.on('pageerror',error=>errors.push(error.message));
+      const dashboard={...syntheticDashboard(),credentialConfigured:true},owned={id:'new-watch',owner:'demo-owner',name:'new-watch',visibility:'private',archived:false,metrics:{}};
+      let release,discovered=false;
+      const pending=new Promise(resolve=>release=resolve);
+      let started;const requested=new Promise(resolve=>started=resolve);
+      const harness=await installSyntheticDemo(context,{dashboard,api:async({url,send})=>{
+        if(url.pathname==='/api/discover'&&operation!=='discover'){
+          discovered=true;await send({status:'ok',repositories:[{...owned,watched:dashboard.repos.some(r=>r.id===owned.id)}]});return true;
+        }
+        const target=operation==='unwatch'?'/api/watches/atlas/pause':operation==='discover'?'/api/discover':'/api/watches';
+        if(url.pathname!==target)return false;
+        started();await pending;
+        if(failure)await send({error:'sensitive delayed failure'},500);
+        else if(operation==='unwatch'){dashboard.repos=dashboard.repos.filter(r=>r.id!=='atlas');await send({ok:true});}
+        else if(operation==='discover')await send({status:'ok',repositories:[owned]});
+        else{dashboard.repos.push(owned);await send({repository:owned});}
+        return true;
+      }});
+      await page.goto(DEMO_ORIGIN);await page.waitForSelector('.project-card');
+      if(operation==='unwatch'){await page.click('[data-project="atlas"] [data-unwatch]');await page.click('#confirm-pause');}
+      else{
+        await page.click('#settings');
+        if(operation==='public-watch'){await page.fill('#repository','demo-owner/new-watch');await page.click('#watch-form button');}
+        else{await page.click('#discover');if(operation==='owned-watch'){await page.waitForSelector('[data-add-owned]');await page.click('[data-add-owned]');assert.equal(discovered,true);}}
+      }
+      await requested;await page.keyboard.press('Escape');
+      if(operation==='unwatch')await page.click('[data-project="orbit"] [data-metric="issues"]');
+      else{await page.click('#settings');await page.fill('#repository','demo-owner/NEW-DRAFT');}
+      const title=await page.locator('#dialog-title').textContent();
+      release();
+      if(!failure&&operation==='unwatch')await page.waitForFunction(()=>!document.querySelector('[data-project="atlas"]'));
+      else if(!failure&&operation.endsWith('watch'))await page.waitForSelector('[data-project="new-watch"]',{state:'attached'});
+      // Drain the delayed response and any resulting refresh/discovery requests.
+      await page.waitForLoadState('networkidle');
+      assert.equal(await page.isVisible('#dialog'),true,'the newer modal remains open');
+      assert.equal(await page.locator('#dialog-title').textContent(),title);
+      assert.equal(await page.locator('#dialog-message').textContent(),'','no stale success or error feedback');
+      assert.equal(await page.isVisible('#toast'),false,'no stale dialog feedback escapes as a toast');
+      if(operation!=='unwatch'){
+        assert.equal(await page.inputValue('#repository'),'demo-owner/NEW-DRAFT');
+        assert.equal(await page.locator('#discovery').textContent(),'','old discovery must not populate new Settings');
+        assert.equal(await page.locator('#watch-form button').isEnabled(),true);
+        if(!failure&&operation.endsWith('watch'))assert.equal(await page.locator('[data-watched="new-watch"]').count(),1,'background refresh still updates the watch inventory');
+      }
+      assert.deepEqual(errors,[]);assert.deepEqual(harness.blocked,[]);
+    });
+  }
+});
+
 test('actionable drill-downs, accessibility, pagination and request isolation',async t=>{
   const browser=await chromium.launch({headless:true,...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE?{executablePath:process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE}:{})});
   t.after(()=>browser.close());
@@ -224,6 +465,8 @@ test('actionable drill-downs, accessibility, pagination and request isolation',a
     if(mode==='error')return send({error:'sensitive upstream response'},500);
     if(mode==='expired')return send({error:'locked'},401);
     if(mode==='stale')return send({...data,status:'error',complete:false});
+    if(mode==='named')return send({...data,kind:'events',complete:false,status:'partial',coverage:{complete:false,label:'GitHub Events is capped at 300 events / 30 days; actor records are incomplete.'},items:[{id:'named-'+url.searchParams.get('metric'),type:url.searchParams.get('metric'),date:'2026-04-30T12:34:56Z',title:'Observed repository interaction',actor:{login:'demo-avery',name:'Demo Avery',url:'https://github.com/demo-avery'},metadata:{action:'created'},url:'https://github.com/northstar-labs/atlas-api'}],total:1,hasMore:false});
+    if(mode==='legacy-commit')return send({...data,items:[{id:'legacy-commit',type:'commits',date:'2026-04-30',title:'Commit abc123def456',author:'synthetic@example.test',url:'https://github.com/northstar-labs/atlas-api/commit/abc123def456'}],total:1,hasMore:false});
     if(mode==='empty')return send({...data,items:[],total:0,hasMore:false,complete:false,observedAt:null});
     if(mode==='changed')return send({...data,observedAt:'2026-04-30T16:02:00Z'});
     if(mode==='invalid')return send({...data,items:[],hasMore:true,total:20});
@@ -285,6 +528,14 @@ test('actionable drill-downs, accessibility, pagination and request isolation',a
       assert.equal(await page.locator('#dialog .chart-button').count(),0);await close();assert.equal(await page.locator('#detail .chart-button').evaluate(e=>e===document.activeElement),true);
     }
     await page.click('#detail .detail-count');await loaded();await close();await page.click('#back');
+  });
+  await t.test('descriptive commit records, linked actors, metadata and partial named stars/forks',async()=>{
+    await open('commits');const row=page.locator('.record-table tbody tr').first();
+    assert.match(await row.locator('th>a').textContent(),/^Refine request validation/);assert.match(await row.textContent(),/Demo contributor.*demo-avery/);
+    assert.equal(await row.locator('.event-actor a').getAttribute('href'),'https://github.com/demo-avery');
+    assert.match(await row.locator('.event-summary').textContent(),/navigation behavior/);assert.match(await row.locator('.event-metadata').textContent(),/SHA.*Branch.*main/);await close();
+    mode='named';for(const metric of ['stars','forks']){await open(metric);assert.equal(await page.locator('.record-table tbody tr').count(),1);assert.match(await page.locator('#records-state').textContent(),/partial.*300 events.*30 days/);assert.match(await page.locator('.record-table').textContent(),/Demo Avery.*demo-avery/);await close();}
+    mode='legacy-commit';await open('commits');assert.equal(await page.locator('.record-table tbody th>a').textContent(),'Commit (title not recorded) ↗');assert.match(await page.locator('.event-metadata').textContent(),/SHA.*abc123def456/);assert.doesNotMatch(await page.locator('.record-table').textContent(),/synthetic@example/);await close();mode='normal';
   });
   await t.test('bounded load more, retry, empty and stale states never fabricate records',async()=>{
     await open('commits');assert.equal(await page.locator('.record-table tbody tr').count(),50);
