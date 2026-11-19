@@ -8,6 +8,7 @@ import { createServer } from '../src/server.mjs';
 import { createNotifications } from '../src/notifications.mjs';
 import { createObservatory } from '../src/data.mjs';
 import { DatabaseSync } from 'node:sqlite';
+import { aggregate, chartView } from '../public/metrics.js';
 
 const origin = 'https://observatory.example.test';
 const proxyKey = 'synthetic_proxy_secret_12345678901234567890';
@@ -65,15 +66,33 @@ test('dedicated token reads bounded cached home preview directly without proxy k
   assert.deepEqual(response.body.coverage.stars, { observedRepositories: 2, totalRepositories: 2, complete: true, oldestObservedAt: at });
   assert.equal(response.body.notifications.status, 'ready');
   assert.equal(response.body.notifications.unreadCount, 12);
-  assert.equal(response.body.notifications.items.length, 8);
+  assert.equal(response.body.notifications.items.length, 5);
   assert.equal(response.body.notifications.hasMore, true);
   assert.equal(response.body.notifications.coverage.complete, false);
   assert.equal(response.body.notifications.updatedAt, at);
-  assert.deepEqual(response.body.notifications.items.map(item => item.title), inboxBefore.items.slice(0, 8).map(item => item.title));
-  assert.deepEqual(Object.keys(response.body.notifications.items[0]).sort(), ['actor', 'id', 'occurredAt', 'repository', 'title', 'type', 'url']);
+  assert.deepEqual(response.body.notifications.items.map(item => item.title), inboxBefore.items.slice(0, 5).map(item => item.title));
+  assert.deepEqual(Object.keys(response.body.notifications.items[0]).sort(), ['actor', 'id', 'occurredAt', 'readAt', 'repository', 'title', 'type', 'unread', 'url']);
   assert.ok(!response.text.includes(homeToken)); assert.ok(!response.text.includes(proxyKey));
   assert.deepEqual(f.inbox.list(), inboxBefore);
   assert.deepEqual(f.counters(), { ...before, dashboardReads: before.dashboardReads + 1 });
+});
+
+test('latest five include read entries, retain inbox order and preserve the full unread count', async t => {
+  const items = Array.from({ length: 7 }, (_, i) => ({ id: `item-${i}`, title: 'Synthetic event',
+    occurredAt: at, readAt: i % 2 ? null : at }));
+  let reads = 0;
+  const f = await fixture(t, { notifications: { list: query => {
+    reads++;
+    assert.deepEqual(query, { offset: 0, limit: 5, unread: false });
+    return { status: 'ready', unreadCount: 19, items, hasMore: true, updatedAt: at };
+  }, markRead: () => assert.fail('preview cannot mark read') } });
+  const { body } = await f.call(undefined, { headers: f.auth });
+  assert.equal(reads, 1);
+  assert.deepEqual(body.notifications.items.map(item => item.id), items.slice(0, 5).map(item => item.id));
+  assert.deepEqual(body.notifications.items.map(item => item.unread), [false, true, false, true, false]);
+  assert.deepEqual(body.notifications.items.map(item => item.readAt), [at, null, at, null, at]);
+  assert.equal(body.notifications.unreadCount, 19);
+  assert.equal(body.notifications.hasMore, true);
 });
 
 test('home token is exact-target GET only and cannot become a general API credential', async t => {
@@ -187,6 +206,14 @@ test('real dashboard aggregates project through HTTP with no provider calls or d
   } });
   t.after(async () => { await service.close(); await rm(root, { recursive: true, force: true }); });
   await service.addWatch({ repository: 'viewer/repo', access: 'token' }); await service.sync();
+  // Synthetic retained history predates the graph zoom. GET must keep its baseline.
+  const seed = new DatabaseSync(dbPath);
+  try { seed.prepare('INSERT INTO points(repo_id,metric,day,value,observed_at) VALUES(?,?,?,?,?) ON CONFLICT(repo_id,metric,day) DO UPDATE SET value=excluded.value,observed_at=excluded.observed_at')
+    .run('1', 'commits', '2026-04-01', 8, '2026-04-01T12:00:00.000Z'); }
+  finally { seed.close(); }
+  const retained = service.dashboard('30');
+  assert.equal(retained.repos[0].metrics.commits.value, 1);
+  assert.equal(retained.repos[0].metrics.commits.history.value, 9);
   const f = await fixture(t, { dashboard: () => service.dashboard('30') });
   const observer = new DatabaseSync(dbPath, { readOnly: true });
   t.after(() => observer.close());
@@ -196,7 +223,13 @@ test('real dashboard aggregates project through HTTP with no provider calls or d
     const { status, body } = await f.call(undefined, { headers: f.auth });
     assert.equal(status, 200);
     assert.equal(body.summary.repositories, 1);
-    assert.deepEqual(body.summary.metrics.map(m => m.value), [9, 1, 1]);
+    assert.deepEqual(body.summary.metrics.map(m => m.value), [9, 1, 9]);
+    for (const [index, source] of ['stars', 'issues', 'commits'].entries()) {
+      const expected = aggregate(retained.repos, source, retained.dates);
+      assert.deepEqual(body.summary.metrics[index].points, chartView(expected, retained.dates, 'totals').points);
+      assert.equal(body.summary.metrics[index].points.length, 30);
+    }
+    assert.equal(body.summary.metrics[2].graph.history.baseline, 8);
     assert.equal(body.freshness.updatedAt, at);
     assert.equal(body.coverage.stars.oldestObservedAt, at);
     assert.equal(body.notifications.unreadCount, 12);
