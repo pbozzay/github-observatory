@@ -4,7 +4,7 @@ import { randomBytes } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { createServer, validateProxyConfiguration } from './server.mjs';
+import { createServer, validateHomeConfiguration } from './server.mjs';
 import { createObservatory } from './data.mjs';
 import { createNotifications, withNotifications } from './notifications.mjs';
 
@@ -14,9 +14,10 @@ if(!Number.isInteger(port)||port<1024||port>65535)throw new Error('Invalid local
 const root=resolve(fileURLToPath(new URL('../',import.meta.url)));
 const publicOrigin=process.env.OBSERVATORY_PUBLIC_ORIGIN;
 const proxyKey=process.env.OBSERVATORY_PROXY_KEY_FILE?await readSecretFile(process.env.OBSERVATORY_PROXY_KEY_FILE):undefined;
+const homeToken=process.env.OBSERVATORY_HOME_TOKEN_FILE?await readSecretFile(process.env.OBSERVATORY_HOME_TOKEN_FILE):undefined;
 const bind=process.env.OBSERVATORY_BIND_HOST||'127.0.0.1';
 if(!['127.0.0.1','0.0.0.0'].includes(bind)||(bind!=='127.0.0.1'&&(!publicOrigin||!proxyKey)))throw new Error('Non-loopback binding requires an HTTPS origin and proxy key file.');
-validateProxyConfiguration({publicOrigin,proxyKey});
+validateHomeConfiguration({publicOrigin,proxyKey,homeToken});
 const state=await prepareRuntimeDirectory(process.env.OBSERVATORY_DATA_DIR||join(homedir(),'.local','share','github-observatory'),root);
 const token=process.env.GITHUB_TOKEN_FILE?await readSecretFile(process.env.GITHUB_TOKEN_FILE):'';
 const keyPath=join(state,'unlock-key');
@@ -30,7 +31,7 @@ try{
  // stable SQLite lock also protects standalone initialization and test use.
  notifications=createNotifications({dbPath:join(state,'notifications.sqlite'),service:observatory});
  service=withNotifications(observatory,notifications);
- server=createServer({service,notifications,publicDir:join(root,'public'),unlockKey:key,publicOrigin,proxyKey,logger:message=>console.error(message)});
+ server=createServer({service,notifications,publicDir:join(root,'public'),unlockKey:key,publicOrigin,proxyKey,homeToken,logger:message=>console.error(message)});
 }catch(error){try{await notifications?.close();}finally{await observatory.close();}throw error;}
 let interval;
 const period=60*60*1000;
