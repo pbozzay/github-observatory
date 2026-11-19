@@ -3,6 +3,7 @@ import { randomBytes, createHash, timingSafeEqual } from 'node:crypto';
 import { readFileSync, readdirSync, lstatSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { notificationQuery, unavailableNotifications } from './notifications.mjs';
+import { homePreview } from './home-preview.mjs';
 
 const MIME={'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8','.svg':'image/svg+xml','.png':'image/png','.ico':'image/x-icon'};
 const safeEqual=(a,b)=>timingSafeEqual(createHash('sha256').update(String(a)).digest(),createHash('sha256').update(String(b)).digest());
@@ -30,11 +31,18 @@ export function validateProxyConfiguration({publicOrigin,proxyKey}={}){
  return external;
 }
 
-export function createServer({service,notifications,publicDir,unlockKey,publicOrigin,proxyKey,logger=()=>{},now=()=>Date.now()}){
+export function validateHomeConfiguration({publicOrigin,proxyKey,homeToken}={}){
  const external=validateProxyConfiguration({publicOrigin,proxyKey});
+ if(homeToken!==undefined&&(!external||typeof homeToken!=='string'||!/^[A-Za-z0-9_-]{32,128}$/.test(homeToken)||safeEqual(homeToken,proxyKey)))throw new Error('Home integration requires an HTTPS public origin and a distinct strong integration token.');
+ return external;
+}
+
+export function createServer({service,notifications,publicDir,unlockKey,publicOrigin,proxyKey,homeToken,logger=()=>{},now=()=>Date.now()}){
+ const external=validateHomeConfiguration({publicOrigin,proxyKey,homeToken});
  if(typeof unlockKey!=='string'||!unlockKey)throw new Error('Local unlock key required.');
+ if(homeToken!==undefined&&safeEqual(homeToken,unlockKey))throw new Error('Home integration token must differ from the unlock key.');
  const files=publicFiles(publicDir),sessions=new Map();let failures=[];let syncing=false;
- // Presentation hint only. Every request still passes the proxy/session gates below.
+ // Presentation hint only. Browser routes still pass the proxy/session gates below.
  const index=files.get('/index.html');
  if(index){
   const rendered={...index,content:Buffer.from(index.content.toString('utf8').replace('data-auth-mode="local"',`data-auth-mode="${external?'proxy':'local'}"`))};
@@ -49,6 +57,13 @@ export function createServer({service,notifications,publicDir,unlockKey,publicOr
    const host=String(req.headers.host||'');
    const localHealth=external&&req.method==='GET'&&req.url==='/health'&&validHosts.has(host)&&['127.0.0.1','::1','::ffff:127.0.0.1'].includes(req.socket.remoteAddress)&&!req.headers.origin;
    if(localHealth){send(200,{status:'running'});return;}
+   // Exact raw request target only: no URL normalization, queries or other verbs.
+   // This dedicated read token never grants a session or generic API access.
+   const homeRead=homeToken!==undefined&&req.method==='GET'&&req.url==='/api/home-preview'&&host===external.host&&typeof req.headers.authorization==='string'&&safeEqual(req.headers.authorization,`Bearer ${homeToken}`);
+   if(homeRead){
+    if(req.headers.origin&&req.headers.origin!==external.origin)throw problem(403,'Request not permitted.');
+    send(200,homePreview({service,notifications,now}));return;
+   }
    const trustedProxy=Boolean(external&&host===external.host&&typeof req.headers['x-observatory-proxy-key']==='string'&&safeEqual(req.headers['x-observatory-proxy-key'],proxyKey));
    if(external?!trustedProxy:!validHosts.has(host))throw problem(403,'Request not permitted.');
    const origin=external?external.origin:`http://${host}`;
