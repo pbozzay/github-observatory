@@ -12,7 +12,46 @@ const count = value => Number.isSafeInteger(value) && value >= 0 ? value : null;
 const text = (value, max) => typeof value === 'string' ? value.replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, max) : null;
 const timestamp = value => typeof value === 'string' && value.length <= 40 && Number.isFinite(Date.parse(value)) ? new Date(value).toISOString() : null;
 
-function summaryOf(service) {
+// Daily comparisons use the headline's exact observed contributor cohort.
+// In particular, surviving-star reconstructions cannot measure lost stars.
+function dailyChangeOf(projected, source, value, clock) {
+  const result = { value: null, date: clock.date, previousDate: clock.previousDate, timeZone: 'UTC',
+    basis: source === 'commits' ? 'retained-commit-history' : 'observed-balances', reason: null };
+  const unavailable = reason => ({ ...result, reason: `Daily change for the headline's observed contributors unavailable: ${reason}` });
+  const contributors = projected?.contributors || [];
+  if (value === null || !contributors.length) return unavailable('no safe current total.');
+  if (projected.chartComparable === false) return unavailable('observations are not comparable.');
+  let current = 0, previous = 0;
+  for (const repo of contributors) {
+    const raw = repo.rawMetrics?.[source], metric = repo.metrics?.[source];
+    const observedAt = timestamp(raw?.observedAt), availability = repo.metricAvailability?.[source]?.state;
+    if (raw?.status !== 'ok' || (availability && availability !== 'available')) return unavailable('current collection is not available.');
+    if (!observedAt || observedAt.slice(0, 10) !== clock.date || Date.parse(observedAt) > clock.time) {
+      return unavailable('current observation is missing, stale or in the future.');
+    }
+    const history = raw.history;
+    if (source === 'commits' && (!history || !['recorded', 'retained'].includes(history.kind) ||
+      history.complete !== true || history.status !== 'complete')) return unavailable('retained commit history is missing or incomplete.');
+    const series = source === 'commits' ? history.points : raw.points;
+    // Require exactly one real point on each UTC day; never carry a value forward.
+    const exact = date => {
+      const matches = Array.isArray(series) ? series.filter(point => point.date === date) : [];
+      return matches.length === 1 ? count(matches[0].value) : null;
+    };
+    const today = exact(clock.date), yesterday = exact(clock.previousDate);
+    if (today === null || yesterday === null) return unavailable('exact today/yesterday points are missing or invalid.');
+    if (count(metric?.value) === null || today !== metric.value || (source !== 'commits' && today !== raw.value)) {
+      return unavailable('current points do not match the headline contributors.');
+    }
+    current += today; previous += yesterday;
+    if (count(current) === null || count(previous) === null) return unavailable('comparison totals exceed safe integer limits.');
+  }
+  if (current !== value) return unavailable('current total does not match the headline.');
+  const change = current - previous;
+  return Number.isSafeInteger(change) ? { ...result, value: change } : unavailable('change exceeds safe integer limits.');
+}
+
+function summaryOf(service, clock) {
   let dashboard;
   try { dashboard = service.dashboard('30'); if (!Array.isArray(dashboard?.repos)) throw new Error(); }
   catch { dashboard = null; }
@@ -41,7 +80,8 @@ function summaryOf(service) {
       history: history ? { kind: history.kind, status: history.status, complete: history.complete, from: history.from,
         baseline: count(history.baseline), label: text(history.label, 700) } : null };
     return { key, label, value, detail: detail + (history ? ` ${text(historyNote(projected), 700)}` : '') +
-      (comparable ? '' : ' Latest balances are not comparable: different or unknown observation dates.'), points, graph };
+      (comparable ? '' : ' Latest balances are not comparable: different or unknown observation dates.'), points, graph,
+      dailyChange: dailyChangeOf(projected, source, value, clock) };
   });
   return { summary: { repositories: repos?.length ?? null, metrics }, coverage,
     freshness: { updatedAt: timestamp(dashboard?.updatedAt), collecting: typeof dashboard?.collecting === 'boolean' ? dashboard.collecting : null },
@@ -64,8 +104,11 @@ function inboxOf(notifications) {
 }
 
 export function homePreview({ service, notifications, now = Date.now }) {
-  const { summary, coverage, freshness, status: summaryStatus } = summaryOf(service);
+  const instant = new Date(now()), generatedAt = instant.toISOString();
+  const date = generatedAt.slice(0, 10);
+  const previousDate = new Date(Date.parse(date + 'T00:00:00Z') - 86_400_000).toISOString().slice(0, 10);
+  const { summary, coverage, freshness, status: summaryStatus } = summaryOf(service, { time: instant.getTime(), date, previousDate });
   const inbox = inboxOf(notifications);
   const status = summaryStatus === 'error' || inbox.status === 'error' ? 'error' : summaryStatus === 'ready' && inbox.status === 'ready' ? 'ready' : 'partial';
-  return { schemaVersion: 1, generatedAt: new Date(now()).toISOString(), status, summary, freshness, coverage, notifications: inbox };
+  return { schemaVersion: 1, generatedAt, status, summary, freshness, coverage, notifications: inbox };
 }

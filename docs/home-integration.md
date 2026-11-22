@@ -26,9 +26,9 @@ Authenticated reads return HTTP `200`, including explicitly degraded component s
   summary: {
     repositories: number | null,
     metrics: [
-      {key: 'stars', label: 'Stars', value: number | null, detail: string, points: Point[], graph: Graph},
-      {key: 'openIssues', label: 'Open issues', value: number | null, detail: string, points: Point[], graph: Graph},
-      {key: 'commits30d', label: 'Commits', value: number | null, detail: string, points: Point[], graph: Graph}
+      {key: 'stars', label: 'Stars', value: number | null, detail: string, points: Point[], graph: Graph, dailyChange: DailyChange},
+      {key: 'openIssues', label: 'Open issues', value: number | null, detail: string, points: Point[], graph: Graph, dailyChange: DailyChange},
+      {key: 'commits30d', label: 'Commits', value: number | null, detail: string, points: Point[], graph: Graph, dailyChange: DailyChange}
     ]
   },
   freshness: {updatedAt: ISO | null, collecting: boolean | null},
@@ -57,6 +57,12 @@ MetricCoverage = {
   oldestObservedAt: ISO | null
 }
 Point = {date: 'YYYY-MM-DD', value: number | null}
+DailyChange = {
+  value: integer | null,
+  date: 'YYYY-MM-DD', previousDate: 'YYYY-MM-DD', timeZone: 'UTC',
+  basis: 'observed-balances' | 'retained-commit-history',
+  reason: string | null
+}
 Graph = {
   mode: 'totals', kind: 'balance', label: string, comparable: boolean,
   coverage: {start: 'YYYY-MM-DD' | null, end: 'YYYY-MM-DD' | null, complete: boolean},
@@ -78,6 +84,17 @@ Graph = {
 - `points` contains at most 30 ascending UTC dates: a **zoom**, not a history reset. Cumulative commit points retain their pre-window baseline. Stars use recorded balances or the app's coherent reconstructed history of current surviving stars; open issues use observed balances, not a running sum. The headline and graph always use the same contributors. A date is `null` if any headline contributor lacks an observation; unknown history totals are authoritative and never replaced by a window count. All-null points (or `[]` when dates are unavailable) mean no graph, not zero. Preserve null gaps and isolated observed points in SVG rendering.
 - `graph.coverage`, `graph.history` and `detail` preserve the app's retained/reconstructed/partial history metadata for tooltips. `graph.comparable:false` suppresses plotted values when latest recorded balances have different or unknown observation dates. Unsafe integer totals also suppress points. Do not turn partial historical coverage into a routine visible error; show concise current collection errors separately, and put coverage/freshness explanations in titles or tooltips.
 
+### Daily change semantics
+
+- `dailyChange` is additive metadata on all three metrics; schema version, headline values, graphs, coverage, notification behavior and authentication remain unchanged. It is computed only from the already-loaded dashboard. The injected clock is read once for both `generatedAt` and the comparison dates.
+- `date` is **today in UTC** and `previousDate` is the immediately preceding UTC calendar day, not the last two available dates or a rolling 24-hour interval. Today's value is the latest retained observation so far today, not a completed-day count. Both exact daily points are required: no carry-forward, interpolation or missing-as-zero baseline.
+- Comparisons use **exactly the current headline's observed repository contributors** on both dates. Unobserved/noncontributing repositories can remain excluded as they are from the headline; a valid delta can therefore coexist with partial overall coverage. Never substitute a smaller, better-covered cohort for a missing contributor.
+- Stars and open issues use `basis:'observed-balances'`: subtract yesterday's raw observed balance from today's for each contributor. **Do not subtract the displayed star graph**: reconstructed surviving-star history omits removed stars and cannot measure net unstars. A negative star change can correctly coexist with a rising reconstructed graph. Open issues still exclude pull requests.
+- Commits use `basis:'retained-commit-history'`: subtract exact cumulative retained-history points, preserving pre-window history. Each contributor must have complete, available recorded/retained history (`complete:true`, `status:'complete'`); missing, backfilling, limited, failed or inaccessible history suppresses the change. Never substitute the raw 30-day count or reset the retained baseline. This describes the retained default-branch history model, not push events or a guarantee about all GitHub history.
+- Every contributor must have current metric `status:'ok'`, no unavailable metric state, and a valid `observedAt` **today and no later than the response clock**. Current points must match each contributing headline value, raw current balances for stars/issues, and the summed headline. Missing/invalid/duplicate exact-day points, stale/future observations, noncomparable dates, inconsistent counts or unsafe integer inputs/sums return `value:null` with a bounded explanatory `reason`. No observations also means `null`, not zero. These stricter daily checks do not redefine the existing summary completeness flag.
+- A valid signed integer, including negative values and **zero**, has `reason:null`. Rendering belongs to the consumer: hide null and zero changes; render positive changes as small green `(+3)` text and negative changes as small red `(-1)` text. Do not infer a positive/negative sign from color, or add HTML/color fields to this API.
+- Suggested tooltip for a valid value: **“Today vs yesterday (UTC), for the headline's observed contributors; latest observation today, not a full-day total.”** Include the explicit dates, observation freshness and existing coverage. For null values, use `reason` as text if a coverage tooltip is shown. Partial contributor coverage is not a claim about every watched repository.
+
 ### Notifications and degradation
 
 - `unreadCount` is the full **local Observatory inbox** count, not GitHub's native notification count. Only `status:'ready'` yields a count (including an actual zero). Missing, inaccessible or failed inbox state yields `null`, so the UI must show unknown/unavailable rather than a zero badge.
@@ -88,4 +105,4 @@ Graph = {
 
 ## Verification
 
-`test/home-preview.test.mjs` exercises the live HTTP server, exact method/target auth restrictions, Host/Origin checks, unchanged proxy/session/CSRF gates, bounded real inbox results, mixed read/unread rows, partial/unknown/error semantics, and a real SQLite-backed dashboard with pre-window retained history and no network or database writes on repeated GETs. `test/home-preview-graphs.test.mjs` checks equality with the app model, the 30-point bound, cumulative baselines, contributor alignment, null gaps, real zeros, unsafe totals and incomparable balances. `test/home-runtime.test.mjs` checks strong/distinct configuration, owner-only regular-file loading, invalid startup before runtime-state creation, and a real child-process startup using the file-backed token. All fixtures are synthetic and isolated; no production credentials or deployment changes are needed.
+`test/home-preview-daily-change.test.mjs` checks signed/zero changes, raw-balance unstars despite a rising reconstructed graph, exact UTC dates, missing/stale/future observations, invalid and overflowing counts, contributor consistency, partial cohorts, complete retained commit history, a single injected clock at midnight, and one read-only dashboard call. `test/home-preview.test.mjs` exercises the live HTTP server, exact method/target auth restrictions, Host/Origin checks, unchanged proxy/session/CSRF gates, bounded real inbox results, mixed read/unread rows, partial/unknown/error semantics, and a real SQLite-backed dashboard with pre-window retained history and no network or database writes on repeated GETs. `test/home-preview-graphs.test.mjs` checks equality with the app model, the 30-point bound, cumulative baselines, contributor alignment, null gaps, real zeros, unsafe totals and incomparable balances. `test/home-runtime.test.mjs` checks strong/distinct configuration, owner-only regular-file loading, invalid startup before runtime-state creation, and a real child-process startup using the file-backed token. All fixtures are synthetic and isolated; no production credentials or deployment changes are needed.
