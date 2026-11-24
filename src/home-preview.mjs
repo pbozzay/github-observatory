@@ -1,6 +1,7 @@
 // Read-only, bounded projection of existing application-owned snapshots.
 // This module must never call sync, discovery, notificationContext or refresh.
 import { aggregate, chartView, historyNote, presentRepository } from '../public/metrics.js';
+import { activityText } from './data.mjs';
 
 const METRICS = [
   ['stars', 'stars', 'Stars', 'Latest retained balances'],
@@ -103,12 +104,42 @@ function inboxOf(notifications) {
     updatedAt: timestamp(inbox?.updatedAt), coverage: { complete: false, label: text(inbox?.coverage?.label, 700) || INBOX_COVERAGE } };
 }
 
+function commitsOf(service) {
+  try {
+    const feed = service.activity({ type: 'commits', range: 'all', offset: 0, limit: 5 });
+    if (!Array.isArray(feed?.events) || count(feed.total) === null || feed.events.length !== Math.min(feed.total, 5) ||
+      feed.hasMore !== (feed.total > 5) || !['ready', 'partial'].includes(feed.status)) throw new Error();
+    const items = feed.events.map(item => {
+      // Identifiers/links stay exact or fail closed; only descriptive text is
+      // normalized. Day-only legacy records must never acquire a fake midnight.
+      const day = typeof item.date === 'string' ? item.date.slice(0, 10) : '';
+      const validDay = /^\d{4}-\d{2}-\d{2}$/.test(day) && timestamp(day)?.slice(0, 10) === day;
+      const occurredAt = validDay && item.date === day ? day : validDay && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(item.date) ? timestamp(item.date) : null;
+      const prefix = `https://github.com/${item.repository}/commit/`;
+      if (item.type !== 'commits' || typeof item.id !== 'string' || item.id.length > 128 || !/^[1-9]\d*:commits:[a-fA-F0-9]{1,64}$/.test(item.id) ||
+        typeof item.repository !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9_.-]{1,100}$/.test(item.repository) ||
+        ['.', '..'].includes(item.repository.split('/')[1]) || typeof item.url !== 'string' || item.url.length > 500 ||
+        !item.url.startsWith(prefix) || !/^[a-fA-F0-9]{1,64}$/.test(item.url.slice(prefix.length)) || !occurredAt) throw new Error();
+      const title = activityText(item.title);
+      return { id: item.id, title: !title || /^Commit [a-fA-F0-9]{1,64}$/.test(title) ? 'Commit (title unavailable)' : title,
+        repository: item.repository, url: item.url, author: activityText(item.author, 100) || null, occurredAt };
+    });
+    return { status: feed.status, items, hasMore: feed.hasMore, updatedAt: timestamp(feed.updatedAt),
+      coverage: { complete: false, label: text(feed.coverage?.label, 700) || 'Retained commits only; full history is not guaranteed.' } };
+  } catch {
+    return { status: 'error', items: [], hasMore: null, updatedAt: null,
+      coverage: { complete: false, label: 'Retained commits unavailable; full history is not guaranteed.' } };
+  }
+}
+
 export function homePreview({ service, notifications, now = Date.now }) {
   const instant = new Date(now()), generatedAt = instant.toISOString();
   const date = generatedAt.slice(0, 10);
   const previousDate = new Date(Date.parse(date + 'T00:00:00Z') - 86_400_000).toISOString().slice(0, 10);
   const { summary, coverage, freshness, status: summaryStatus } = summaryOf(service, { time: instant.getTime(), date, previousDate });
   const inbox = inboxOf(notifications);
-  const status = summaryStatus === 'error' || inbox.status === 'error' ? 'error' : summaryStatus === 'ready' && inbox.status === 'ready' ? 'ready' : 'partial';
-  return { schemaVersion: 1, generatedAt, status, summary, freshness, coverage, notifications: inbox };
+  const commits = commitsOf(service);
+  const states = [summaryStatus, inbox.status, commits.status];
+  const status = states.includes('error') ? 'error' : states.every(state => state === 'ready') ? 'ready' : 'partial';
+  return { schemaVersion: 1, generatedAt, status, summary, freshness, coverage, notifications: inbox, commits };
 }

@@ -188,9 +188,13 @@ test('daily metadata reads the one existing dashboard only and never mutates sna
   const before = structuredClone(snapshot);
   const freeze = object => { Object.values(object).filter(value => value && typeof value === 'object').forEach(freeze); Object.freeze(object); };
   freeze(snapshot);
-  let dashboards = 0, inboxes = 0;
-  const forbidden = () => assert.fail('unexpected collector or external action');
-  const service = new Proxy({ dashboard: range => { dashboards++; assert.equal(range, '30'); return snapshot; } }, {
+  let dashboards = 0, inboxes = 0, activities = 0, unexpected = 0;
+  const forbidden = () => { unexpected++; assert.fail('unexpected collector or external action'); };
+  const service = new Proxy({ dashboard: range => { dashboards++; assert.equal(range, '30'); return snapshot; },
+    activity: query => {
+      activities++; assert.deepEqual(query, { type: 'commits', range: 'all', offset: 0, limit: 5 });
+      return { events: [], total: 0, hasMore: false, status: 'ready', updatedAt: null };
+    } }, {
     get: (target, key) => key in target ? target[key] : forbidden,
   });
   const notifications = new Proxy({ list: options => {
@@ -200,6 +204,9 @@ test('daily metadata reads the one existing dashboard only and never mutates sna
   const result = homePreview({ service, notifications, now: () => now });
   assert.equal(dashboards, 1);
   assert.equal(inboxes, 1);
+  assert.equal(activities, 1);
+  assert.equal(unexpected, 0);
+  assert.equal(result.commits.status, 'ready');
   assert.deepEqual(snapshot, before);
   assert.equal(result.notifications.unreadCount, 0);
   result.summary.metrics.forEach(m => assert.equal(m.dailyChange.value, 3));
