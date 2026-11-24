@@ -74,6 +74,8 @@ function oneLine(value, max = 200) {
   const line = value.slice(0, 32_000).split(/\r\n?|\n/, 1)[0].trim();
   return /^(?:`{3,}|~{3,})/.test(line) || codeStatement(line) ? undefined : descriptiveText(line, max);
 }
+// Reuse the collection text boundary for compact read-only projections too.
+export { oneLine as activityText };
 // Git refs are identifiers, never prose: retain exact validated input or omit it.
 function refName(value) {
   if (typeof value !== 'string' || !value.length || value.length > 255 || value === '@' || value.startsWith('-') || value.endsWith('.') || value.includes('..') || value.includes('@{') || /[\s~^:?*\[\\<>]/.test(value) || UNSAFE_TEXT.test(value) || EMAIL.test(value)) return undefined;
@@ -456,7 +458,7 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
       ...(row.author ? { author: row.author } : {}), ...(context ? { ...JSON.parse(context.context), source: context.source, ...(context.observed_at ? { observedAt: context.observed_at } : {}) } : {}) };
   }
   const coverage = () => ({ complete: false, label: 'Retained activity only, not full history. GitHub Events is capped at 300 events / 30 days and may lag 30 seconds–6 hours; collection pages, permissions and rate budgets can leave gaps.' });
-  function activity({ repository, range = 'all', offset = 0, limit = 100, visibility = 'all', search = '', archived } = {}) {
+  function activity({ repository, range = 'all', offset = 0, limit = 100, visibility = 'all', search = '', archived, type } = {}) {
     ensureOpen();
     const integer = (value, min, max) => {
       if (!['number', 'string'].includes(typeof value) || !/^(0|[1-9]\d*)$/.test(String(value)) || !Number.isSafeInteger(Number(value)) || Number(value) < min || Number(value) > max) throw safe('Invalid activity pagination.');
@@ -467,21 +469,36 @@ export async function createObservatory({ dbPath, token = '', fetchImpl = global
     if (!['all', 'public', 'private'].includes(visibility)) throw safe('Invalid visibility.');
     if (typeof search !== 'string' || search.length > 200 || /[\u0000-\u001f\u007f-\u009f]/.test(search)) throw safe('Invalid search.');
     if (archived !== undefined && ![true, false, 'true', 'false'].includes(archived)) throw safe('Invalid archive filter.');
-    const params = [], clauses = ['repositories.paused=0', 'a.day<=?'];
-    params.push(isoDay(clock()));
+    if (type !== undefined && type !== 'commits') throw safe('Invalid activity type.');
+    const params = [], clauses = ['repositories.paused=0'];
     if (visibility !== 'all') { clauses.push('repositories.visibility=?'); params.push(visibility); }
     if (archived !== undefined) { clauses.push('repositories.archived=?'); params.push(Number(archived === true || archived === 'true')); }
     if (search.trim()) { clauses.push("instr(lower(repositories.owner || '/' || repositories.name),lower(?))>0"); params.push(search.trim()); }
     if (repository !== undefined) {
       if (typeof repository !== 'string' || !/^[1-9]\d*$/.test(repository)) throw safe('Invalid repository ID.');
       if (!db.prepare('SELECT 1 FROM repositories WHERE id=? AND paused=0').get(repository)) throw safe('Watch not found.', 404);
-      clauses.push('a.repo_id=?'); params.push(repository);
+      clauses.push('repositories.id=?'); params.push(repository);
     }
+    const repositoryScope = clauses.join(' AND '), repositoryParams = [...params];
+    clauses.push('a.day<=?'); params.push(isoDay(clock()));
     if (String(range) !== 'all') { clauses.push('a.day>=?'); params.push(dateWindow(range).start); }
+    if (type !== undefined) { clauses.push('a.type=?'); params.push(type); }
     const scope = `FROM activity_records a JOIN repositories ON repositories.id=a.repo_id WHERE ${clauses.join(' AND ')}`;
     const total = db.prepare(`SELECT COUNT(*) AS count ${scope}`).get(...params).count;
     const records = db.prepare(`SELECT a.*,repositories.owner,repositories.name ${scope} ORDER BY COALESCE(a.occurred_at,a.day) DESC,a.id LIMIT ? OFFSET ?`).all(...params, limit, offset).map(eventRecord);
-    return { events: records, total, hasMore: offset < total - records.length, offset, limit, coverage: coverage() };
+    const result = { events: records, total, hasMore: offset < total - records.length, offset, limit, coverage: coverage() };
+    if (type === 'commits') {
+      // Include watches with no records: an empty page cannot establish a
+      // successful empty collection. Never borrow the mixed feed's freshness.
+      const runs = db.prepare(`SELECT runs.status,runs.last_success,runs.last_attempt FROM repositories
+        LEFT JOIN runs ON runs.repo_id=repositories.id AND runs.metric='commits' WHERE ${repositoryScope}`).all(...repositoryParams);
+      const observed = runs.map(row => timestamp(row.status === 'empty_repository' ? row.last_attempt : row.last_success));
+      result.status = runs.every((row, i) => ['ok', 'empty_repository'].includes(row.status) && observed[i]) ? 'ready' : 'partial';
+      result.updatedAt = observed.length && observed.every(Boolean) ? observed.sort()[0] : null;
+      result.coverage = { complete: false, label: 'Retained default-branch commits across active watches, including your own; not full GitHub history. Collection limits, permissions and gaps may omit commits.' +
+        (result.status === 'partial' ? ' Commit collection is unavailable or incomplete for some watches; retained items may be stale.' : '') };
+    }
+    return result;
   }
   function details({ repository, metric, range = '30', offset = 0, limit = 50 } = {}) {
     ensureOpen();

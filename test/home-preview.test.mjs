@@ -25,7 +25,14 @@ async function fixture(t, options = {}) {
   const service = {
     dashboard: range => { dashboardReads++; assert.equal(range, '30'); return (options.dashboard || dashboard)(); },
     notificationContext: async () => { contexts++; return { viewer: 'viewer', repositories: [{ id: '1', owner: 'viewer', name: 'repo' }], status: 'ready' }; },
-    activity: () => { activities++; return { events: Array.from({ length: 12 }, (_, i) => ({ id: `github:${i}`, repositoryId: '1', repository: 'viewer/repo', type: 'issue_comment', metadata: { action: 'created', number: i + 1 }, source: 'github_events', date: new Date(Date.parse(at) - i * 1000).toISOString(), actor: { login: 'other' }, url: `https://github.com/viewer/repo/issues/${i + 1}` })), total: 12, hasMore: false }; },
+    activity: query => {
+      activities++;
+      if (query?.type === 'commits') {
+        assert.deepEqual(query, { type: 'commits', range: 'all', offset: 0, limit: 5 });
+        return { events: [], total: 0, hasMore: false, status: 'ready', updatedAt: at };
+      }
+      return { events: Array.from({ length: 12 }, (_, i) => ({ id: `github:${i}`, repositoryId: '1', repository: 'viewer/repo', type: 'issue_comment', metadata: { action: 'created', number: i + 1 }, source: 'github_events', date: new Date(Date.parse(at) - i * 1000).toISOString(), actor: { login: 'other' }, url: `https://github.com/viewer/repo/issues/${i + 1}` })), total: 12, hasMore: false };
+    },
     sync: async () => { mutations++; }, status: () => ({ collecting: false }),
     discover: async () => { mutations++; return {}; }, addWatch: async () => { mutations++; }, pauseWatch: async () => { mutations++; },
   };
@@ -74,7 +81,7 @@ test('dedicated token reads bounded cached home preview directly without proxy k
   assert.deepEqual(Object.keys(response.body.notifications.items[0]).sort(), ['actor', 'id', 'occurredAt', 'readAt', 'repository', 'title', 'type', 'unread', 'url']);
   assert.ok(!response.text.includes(homeToken)); assert.ok(!response.text.includes(proxyKey));
   assert.deepEqual(f.inbox.list(), inboxBefore);
-  assert.deepEqual(f.counters(), { ...before, dashboardReads: before.dashboardReads + 1 });
+  assert.deepEqual(f.counters(), { ...before, dashboardReads: before.dashboardReads + 1, activities: before.activities + 1 });
 });
 
 test('latest five include read entries, retain inbox order and preserve the full unread count', async t => {
